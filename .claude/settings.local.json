@@ -2,7 +2,8 @@
   "permissions": {
     "allow": [
       "Bash(zig build test)",
-      "Bash(zig build)"
+      "Bash(zig build)",
+      "Bash(zig build run)"
     ],
     "deny": [],
     "ask": []

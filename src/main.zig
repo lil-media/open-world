@@ -1,5 +1,6 @@
 const std = @import("std");
-const terrain = @import("terrain.zig");
+const terrain = @import("terrain/terrain.zig");
+const generator = @import("terrain/generator.zig");
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};

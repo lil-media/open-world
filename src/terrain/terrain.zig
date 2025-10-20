@@ -53,7 +53,8 @@ pub const Chunk = struct {
         return chunk;
     }
 
-    /// Generate terrain for this chunk using simple height-based generation
+    /// Generate terrain for this chunk (deprecated - use TerrainGenerator instead)
+    /// This is kept for backward compatibility with tests
     pub fn generate(self: *Chunk) void {
         const x64 = @as(u64, @intCast(self.x));
         const z64 = @as(u64, @intCast(self.z));

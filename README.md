@@ -1,35 +1,76 @@
 # Open World Game
 
-A Zig-based open world game with terrain building and manipulation capabilities.
+A high-performance voxel-based open world building game built with Zig, optimized for macOS and Apple Silicon with Metal graphics, and multiplayer support.
 
 ## Features
 
-- Chunk-based terrain system (16x16x256 blocks per chunk)
-- Multiple block types (air, dirt, grass, stone, water, sand)
-- Terrain generation with height-based world generation
-- Terrain manipulation tools:
-  - Dig: Remove blocks
+### Current (Phase 1)
+- **Advanced Terrain Generation**
+  - 3D Simplex noise with Fractional Brownian Motion
+  - 8 distinct biomes (plains, forest, desert, mountains, ocean, beach, tundra, savanna)
+  - 3D cave systems using density-based generation
+  - Realistic terrain features with domain warping
+
+- **Voxel System**
+  - Chunk-based architecture (16x16x256 blocks)
+  - Multiple block types (air, dirt, grass, stone, water, sand)
+  - Efficient chunk management
+
+- **Terrain Editing Tools**
+  - Dig: Remove blocks with spherical brush
   - Place: Add blocks
-  - Flatten: Smooth terrain to a specific height
-  - Raise: Elevate terrain
-  - Lower: Depress terrain
-- Configurable brush sizes for terrain editing
+  - Flatten: Smooth terrain to target height
+  - Raise/Lower: Sculpt terrain
+  - Configurable brush sizes (1-10 blocks)
+
+- **Math & Utilities**
+  - Vec3, Vec3i for positions and directions
+  - AABB collision detection
+  - Mat4 transformations
+  - Frustum culling support
+
+### Planned
+- Metal 4 graphics rendering (GPU-driven, Apple Silicon optimized)
+- Greedy meshing for efficient rendering
+- LOD system (4 tiers)
+- Asynchronous chunk streaming
+- Player physics and collision
+- Lighting system (sunlight + block lights)
+- Inventory and crafting
+- Day/night cycle and weather
+- Multiplayer support (client-server architecture)
+
+See [ROADMAP.md](ROADMAP.md) for detailed development plan.
 
 ## Project Structure
 
 ```
 open-world/
-├── build.zig              # Build configuration
+├── build.zig                      # Build configuration
 ├── src/
-│   ├── main.zig          # Entry point and game loop
-│   ├── terrain.zig       # Terrain system (blocks, chunks, world)
-│   └── terrain_editor.zig # Terrain manipulation tools
-└── README.md
+│   ├── main.zig                   # Entry point and game loop
+│   ├── terrain/
+│   │   ├── terrain.zig            # Chunk & block system
+│   │   ├── generator.zig          # Procedural terrain generation
+│   │   └── editor.zig             # Terrain manipulation tools
+│   ├── utils/
+│   │   ├── math.zig               # Math utilities (Vec3, Mat4, AABB)
+│   │   └── noise.zig              # Simplex noise, FBM, domain warping
+│   ├── platform/                  # (Planned) macOS/Metal integration
+│   ├── rendering/                 # (Planned) Rendering pipeline
+│   ├── physics/                   # (Planned) Collision & player physics
+│   ├── game/                      # (Planned) Inventory, crafting, entities
+│   └── network/                   # (Planned) Multiplayer networking
+├── README.md                      # This file
+└── ROADMAP.md                     # Development roadmap
 ```
 
 ## Requirements
 
-- Zig 0.15.0 or later
+- **Zig 0.15.0+** (tested on 0.15.1)
+- **macOS 12.0+** (for Metal support)
+- **Apple Silicon** (M1/M2/M3) recommended
+  - Intel Macs with Metal support also work but not optimized
 
 ## Building
 
@@ -56,6 +97,10 @@ zig build test
 - **Block**: Individual voxel with a type (air, dirt, grass, stone, water, sand)
 - **Chunk**: 16x16x256 collection of blocks representing a section of the world
 - **World**: Collection of chunks with methods for accessing and modifying terrain
+- **TerrainGenerator**: Advanced procedural generation with biomes and caves
+  - Uses 3D Simplex noise for realistic terrain
+  - Supports 8 biomes with distinct characteristics
+  - Generates caves using density-based 3D carving
 
 ### Terrain Editor
 
@@ -69,16 +114,51 @@ The terrain editor provides various tools for manipulating the world:
 
 All tools support configurable brush sizes (1-10 blocks).
 
-## Next Steps
+### Math Utilities
 
-- [ ] Add window and rendering system (raylib, SDL, or custom OpenGL)
-- [ ] Implement camera controls for world navigation
-- [ ] Add Perlin/Simplex noise for better terrain generation
-- [ ] Implement mesh generation for efficient rendering
-- [ ] Add player physics and collision detection
-- [ ] Implement saving/loading world data
-- [ ] Add biomes and more diverse terrain features
-- [ ] Optimize chunk loading/unloading based on player position
+- **Vec3/Vec3i**: 3D vectors for positions and directions
+- **AABB**: Axis-aligned bounding boxes for collision detection
+- **Mat4**: 4x4 matrices for transformations and projections
+- **Frustum**: View frustum for efficient culling
+
+### Noise Generation
+
+- **SimplexNoise**: Fast 3D noise with fewer artifacts than Perlin
+- **FBM**: Fractional Brownian Motion for layered detail
+- **DomainWarp**: Creates organic, flowing terrain features
+
+## Performance Targets
+
+- **60 FPS** @ 1080p with 16 chunk view distance (M1)
+- **120 FPS** @ 1080p with 16 chunk view distance (M3+)
+- **<4GB RAM** for typical gameplay
+- **<100ms** chunk generation time
+
+## Development Status
+
+**Current Phase:** Phase 1 - Foundation (40% complete)
+
+✅ Completed:
+- Project structure and module organization
+- Math utilities (vectors, matrices, collision)
+- Simplex noise and FBM terrain generation
+- Biome system with 8 biomes
+- Basic terrain editor
+
+🏗️ In Progress:
+- Greedy meshing algorithm
+- Metal rendering integration
+
+📋 Next:
+- Camera system
+- Asynchronous chunk streaming
+- Player physics
+
+See [ROADMAP.md](ROADMAP.md) for complete development plan.
+
+## Contributing
+
+This is currently a solo development project, but contributions are welcome once the core architecture is stable.
 
 ## License
 
