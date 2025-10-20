@@ -3,7 +3,8 @@
     "allow": [
       "Bash(zig build test)",
       "Bash(zig build)",
-      "Bash(zig build run)"
+      "Bash(zig build run)",
+      "Bash(zig build render)"
     ],
     "deny": [],
     "ask": []

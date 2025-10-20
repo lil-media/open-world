@@ -25,8 +25,8 @@ pub const Block = struct {
 
 /// A chunk of terrain (16x16x256 blocks)
 pub const Chunk = struct {
-    const CHUNK_SIZE = 16;
-    const CHUNK_HEIGHT = 256;
+    pub const CHUNK_SIZE = 16;
+    pub const CHUNK_HEIGHT = 256;
 
     blocks: [CHUNK_SIZE][CHUNK_SIZE][CHUNK_HEIGHT]Block,
     x: i32,

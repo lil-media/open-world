@@ -13,8 +13,21 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
-    // Link system libraries for graphics
+    // Link system libraries
     exe.linkLibC();
+
+    // Add macOS frameworks for Metal rendering
+    if (target.result.os.tag == .macos) {
+        exe.linkFramework("Metal");
+        exe.linkFramework("MetalKit");
+        exe.linkFramework("QuartzCore");
+        exe.linkFramework("Cocoa");
+
+        // SDL2 for window management
+        exe.linkSystemLibrary("SDL2");
+        exe.addIncludePath(.{ .cwd_relative = "/opt/homebrew/include" });
+        exe.addLibraryPath(.{ .cwd_relative = "/opt/homebrew/lib" });
+    }
 
     b.installArtifact(exe);
 
@@ -27,6 +40,41 @@ pub fn build(b: *std.Build) void {
 
     const run_step = b.step("run", "Run the open world game");
     run_step.dependOn(&run_cmd.step);
+
+    // Render demo executable
+    const render_demo = b.addExecutable(.{
+        .name = "render-demo",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/render_demo.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+
+    render_demo.linkLibC();
+    if (target.result.os.tag == .macos) {
+        // Add Objective-C Metal bridge
+        render_demo.addCSourceFile(.{
+            .file = b.path("src/rendering/metal_bridge.m"),
+            .flags = &[_][]const u8{"-fobjc-arc"},
+        });
+
+        render_demo.linkFramework("Metal");
+        render_demo.linkFramework("MetalKit");
+        render_demo.linkFramework("QuartzCore");
+        render_demo.linkFramework("Cocoa");
+        render_demo.linkSystemLibrary("SDL2");
+        render_demo.addIncludePath(.{ .cwd_relative = "/opt/homebrew/include" });
+        render_demo.addLibraryPath(.{ .cwd_relative = "/opt/homebrew/lib" });
+    }
+
+    b.installArtifact(render_demo);
+
+    const render_run_cmd = b.addRunArtifact(render_demo);
+    render_run_cmd.step.dependOn(b.getInstallStep());
+
+    const render_step = b.step("render", "Run the rendering demo");
+    render_step.dependOn(&render_run_cmd.step);
 
     const unit_tests = b.addTest(.{
         .root_module = b.createModule(.{
