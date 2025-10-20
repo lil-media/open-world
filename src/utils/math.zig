@@ -1,5 +1,61 @@
 const std = @import("std");
 
+/// 2D Vector for positions and offsets
+pub const Vec2 = struct {
+    x: f32,
+    y: f32,
+
+    pub fn init(x: f32, y: f32) Vec2 {
+        return .{ .x = x, .y = y };
+    }
+
+    pub fn zero() Vec2 {
+        return init(0, 0);
+    }
+
+    pub fn one() Vec2 {
+        return init(1, 1);
+    }
+
+    pub fn add(self: Vec2, other: Vec2) Vec2 {
+        return init(self.x + other.x, self.y + other.y);
+    }
+
+    pub fn sub(self: Vec2, other: Vec2) Vec2 {
+        return init(self.x - other.x, self.y - other.y);
+    }
+
+    pub fn mul(self: Vec2, scalar: f32) Vec2 {
+        return init(self.x * scalar, self.y * scalar);
+    }
+
+    pub fn dot(self: Vec2, other: Vec2) f32 {
+        return self.x * other.x + self.y * other.y;
+    }
+
+    pub fn length(self: Vec2) f32 {
+        return @sqrt(self.dot(self));
+    }
+
+    pub fn lengthSquared(self: Vec2) f32 {
+        return self.dot(self);
+    }
+
+    pub fn normalize(self: Vec2) Vec2 {
+        const len = self.length();
+        if (len == 0) return self;
+        return self.mul(1.0 / len);
+    }
+
+    pub fn distance(self: Vec2, other: Vec2) f32 {
+        return self.sub(other).length();
+    }
+
+    pub fn lerp(self: Vec2, other: Vec2, t: f32) Vec2 {
+        return self.add(other.sub(self).mul(t));
+    }
+};
+
 /// 3D Vector for positions, directions, and normals
 pub const Vec3 = struct {
     x: f32,
@@ -311,6 +367,18 @@ pub fn toRadians(degrees_val: f32) f32 {
 
 pub fn toDegrees(radians_val: f32) f32 {
     return radians_val * 180.0 / std.math.pi;
+}
+
+test "Vec2 operations" {
+    const v1 = Vec2.init(1, 2);
+    const v2 = Vec2.init(3, 4);
+
+    const sum = v1.add(v2);
+    try std.testing.expectEqual(@as(f32, 4), sum.x);
+    try std.testing.expectEqual(@as(f32, 6), sum.y);
+
+    const normalized = v1.normalize();
+    try std.testing.expectApproxEqAbs(@as(f32, 1), normalized.length(), 0.0001);
 }
 
 test "Vec3 operations" {

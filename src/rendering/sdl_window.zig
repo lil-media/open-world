@@ -1,4 +1,5 @@
 const std = @import("std");
+const input = @import("../platform/input.zig");
 const c = @cImport({
     @cInclude("SDL2/SDL.h");
     @cInclude("SDL2/SDL_metal.h");
@@ -21,8 +22,8 @@ pub const SDLWindow = struct {
             title,
             c.SDL_WINDOWPOS_CENTERED,
             c.SDL_WINDOWPOS_CENTERED,
-            @intCast(width),
-            @intCast(height),
+            @as(c_int, @intCast(width)),
+            @as(c_int, @intCast(height)),
             c.SDL_WINDOW_METAL | c.SDL_WINDOW_SHOWN | c.SDL_WINDOW_RESIZABLE,
         ) orelse {
             std.debug.print("SDL_CreateWindow failed: {s}\n", .{c.SDL_GetError()});
@@ -49,20 +50,58 @@ pub const SDLWindow = struct {
         c.SDL_Quit();
     }
 
-    pub fn pollEvents(self: *SDLWindow) void {
+    pub fn pollEvents(self: *SDLWindow, input_state: ?*input.InputState) void {
         var event: c.SDL_Event = undefined;
         while (c.SDL_PollEvent(&event) != 0) {
             switch (event.type) {
                 c.SDL_QUIT => self.should_close = true,
                 c.SDL_KEYDOWN => {
+                    if (input_state) |state| {
+                        state.handleKey(@as(u16, @intCast(event.key.keysym.scancode)), true);
+                    }
                     if (event.key.keysym.sym == c.SDLK_ESCAPE) {
                         self.should_close = true;
                     }
                 },
+                c.SDL_KEYUP => {
+                    if (input_state) |state| {
+                        state.handleKey(@as(u16, @intCast(event.key.keysym.scancode)), false);
+                    }
+                },
+                c.SDL_MOUSEBUTTONDOWN => {
+                    if (input_state) |state| {
+                        state.handleMouseButton(@as(u8, @intCast(event.button.button)), true);
+                    }
+                },
+                c.SDL_MOUSEBUTTONUP => {
+                    if (input_state) |state| {
+                        state.handleMouseButton(@as(u8, @intCast(event.button.button)), false);
+                    }
+                },
+                c.SDL_MOUSEMOTION => {
+                    if (input_state) |state| {
+                        state.handleMouseMotion(
+                            @as(f32, @floatFromInt(event.motion.xrel)),
+                            @as(f32, @floatFromInt(event.motion.yrel)),
+                        );
+                        state.setMousePosition(
+                            @as(f32, @floatFromInt(event.motion.x)),
+                            @as(f32, @floatFromInt(event.motion.y)),
+                        );
+                    }
+                },
+                c.SDL_MOUSEWHEEL => {
+                    if (input_state) |state| {
+                        state.handleMouseWheel(
+                            @as(f32, @floatFromInt(event.wheel.x)),
+                            @as(f32, @floatFromInt(event.wheel.y)),
+                        );
+                    }
+                },
                 c.SDL_WINDOWEVENT => {
                     if (event.window.event == c.SDL_WINDOWEVENT_RESIZED) {
-                        self.width = @intCast(event.window.data1);
-                        self.height = @intCast(event.window.data2);
+                        self.width = @as(u32, @intCast(event.window.data1));
+                        self.height = @as(u32, @intCast(event.window.data2));
                     }
                 },
                 else => {},

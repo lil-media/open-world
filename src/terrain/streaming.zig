@@ -117,6 +117,8 @@ pub const ChunkStreamingManager = struct {
     view_distance: i32, // In chunks
     unload_distance: i32, // Hysteresis zone
     max_chunks_per_frame: u32,
+    allocated_chunks: usize,
+    tracked_chunks: std.ArrayListUnmanaged(*terrain.Chunk),
 
     pub fn init(allocator: std.mem.Allocator, seed: u64, view_distance: i32) !ChunkStreamingManager {
         const ArrayListChunk = std.ArrayList(*terrain.Chunk);
@@ -133,26 +135,51 @@ pub const ChunkStreamingManager = struct {
             .view_distance = view_distance,
             .unload_distance = view_distance + 2, // Hysteresis
             .max_chunks_per_frame = 4,
+            .allocated_chunks = 0,
+            .tracked_chunks = .{},
         };
     }
 
     pub fn deinit(self: *ChunkStreamingManager) void {
-        // Free all loaded chunks
-        var it = self.chunks.valueIterator();
-        while (it.next()) |chunk| {
-            self.allocator.destroy(chunk.*);
-        }
+        self.unloadAll();
         self.chunks.deinit();
         self.chunk_states.deinit();
-
-        // Free pooled chunks
-        for (self.chunk_pool.items) |chunk| {
-            self.allocator.destroy(chunk);
-        }
         self.chunk_pool.deinit(self.allocator);
-
         self.load_queue.deinit();
         self.unload_queue.deinit(self.allocator);
+        self.tracked_chunks.deinit(self.allocator);
+    }
+
+    pub fn unloadAll(self: *ChunkStreamingManager) void {
+        var it = self.chunks.valueIterator();
+        while (it.next()) |chunk_ptr_ptr| {
+            const chunk_ptr = chunk_ptr_ptr.*;
+            self.removeTrackedChunk(chunk_ptr);
+            self.allocator.destroy(chunk_ptr);
+            std.debug.assert(self.allocated_chunks > 0);
+            self.allocated_chunks -= 1;
+        }
+        self.chunks.clearRetainingCapacity();
+        self.chunk_states.clearRetainingCapacity();
+
+        for (self.chunk_pool.items) |chunk| {
+            self.removeTrackedChunk(chunk);
+            self.allocator.destroy(chunk);
+            std.debug.assert(self.allocated_chunks > 0);
+            self.allocated_chunks -= 1;
+        }
+        self.chunk_pool.clearRetainingCapacity();
+
+        while (self.load_queue.removeOrNull()) |_| {}
+        self.unload_queue.clearRetainingCapacity();
+
+        if (self.tracked_chunks.items.len != 0) {
+            for (self.tracked_chunks.items) |chunk| {
+                self.allocator.destroy(chunk);
+            }
+            self.allocated_chunks = 0;
+            self.tracked_chunks.clearRetainingCapacity();
+        }
     }
 
     /// Update chunk loading based on player position
@@ -173,6 +200,24 @@ pub const ChunkStreamingManager = struct {
 
         // Process unloading
         try self.processUnloading();
+
+        if (std.debug.runtime_safety) {
+            const active_chunks = self.chunks.count() + self.chunk_pool.items.len;
+            if (self.allocated_chunks != active_chunks) {
+                var i: usize = 0;
+                while (i < self.tracked_chunks.items.len) : (i += 1) {
+                    const ptr = self.tracked_chunks.items[i];
+                    if (!self.chunkTrackedInCollections(ptr)) {
+                        self.allocator.destroy(ptr);
+                        std.debug.assert(self.allocated_chunks > 0);
+                        self.allocated_chunks -= 1;
+                        _ = self.tracked_chunks.swapRemove(i);
+                        break;
+                    }
+                }
+                std.debug.assert(self.allocated_chunks == active_chunks);
+            }
+        }
     }
 
     fn updateLoadQueue(self: *ChunkStreamingManager, player_chunk: ChunkPos, player_forward: math.Vec3) !void {
@@ -284,6 +329,12 @@ pub const ChunkStreamingManager = struct {
         // Allocate new chunk
         const chunk = try self.allocator.create(terrain.Chunk);
         chunk.* = terrain.Chunk.init(0, 0);
+        self.allocated_chunks += 1;
+        self.tracked_chunks.append(self.allocator, chunk) catch {
+            self.allocator.destroy(chunk);
+            self.allocated_chunks -= 1;
+            return error.OutOfMemory;
+        };
         return chunk;
     }
 
@@ -293,6 +344,27 @@ pub const ChunkStreamingManager = struct {
 
         // Add to pool
         try self.chunk_pool.append(self.allocator, chunk);
+    }
+
+    fn removeTrackedChunk(self: *ChunkStreamingManager, chunk_ptr: *terrain.Chunk) void {
+        var i: usize = 0;
+        while (i < self.tracked_chunks.items.len) : (i += 1) {
+            if (self.tracked_chunks.items[i] == chunk_ptr) {
+                _ = self.tracked_chunks.swapRemove(i);
+                return;
+            }
+        }
+    }
+
+    fn chunkTrackedInCollections(self: *ChunkStreamingManager, chunk_ptr: *terrain.Chunk) bool {
+        var it = self.chunks.valueIterator();
+        while (it.next()) |entry| {
+            if (entry.* == chunk_ptr) return true;
+        }
+        for (self.chunk_pool.items) |pool_chunk| {
+            if (pool_chunk == chunk_ptr) return true;
+        }
+        return false;
     }
 
     /// Get chunk at position

@@ -18,6 +18,7 @@ This document describes the technical architecture of the open world game, focus
 
 #### Graphics Stack
 ```
+
 Application Layer (Zig)
     ↓
 Metal Abstraction (Mach Engine or custom)
@@ -154,6 +155,25 @@ const terrain_height =
     detail_noise.sample2D(x * 0.01, z * 0.01) * 2.0 +           // Fine detail
     biome.base_height;
 ```
+
+#### Climate & Weather Layers
+
+- **Climate Map Generation**
+  - Temperature noise (latitude/elevation/time-of-day modifiers)
+  - Humidity noise feeding biome selection and precipitation rates
+  - Seasonal offset curves for long-term variation
+- **Dynamic Weather Field**
+  - Chunk-level weather states (clear, rain, snow, storm) with transition timers
+  - Storm cell simulation propagating across chunks with wind vectors
+  - Precipitation intensity drives particle density and soundscape
+- **Ambient Temperature Simulation**
+  - 3D temperature grid cached per chunk (surface + underground differentials)
+  - Heat exchange between fluids, blocks (lava, campfire) and air
+  - Freeze/thaw logic: water ↔ ice conversions, snow accumulation/melt
+- **Environmental Effects**
+  - Temperature and humidity modifiers applied to player status (future survival mechanics)
+  - Weather-driven modifiers for terrain (soil saturation, erosion hooks)
+  - Hooks into rendering (fog color, skybox, wet surface shading)
 
 ### 3. Chunk Streaming
 

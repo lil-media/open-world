@@ -7,5 +7,5 @@ pub fn main() !void {
     const allocator = gpa.allocator();
 
     // Run the enhanced interactive demo with visualization
-    try demo.runInteractiveDemo(allocator);
+    try demo.runInteractiveDemo(allocator, .{});
 }

@@ -116,8 +116,8 @@ pub const Vertex = extern struct {
 
 /// Uniform buffer for MVP matrices
 pub const Uniforms = extern struct {
-    model_view_projection: math.Mat4,
-    model: math.Mat4,
-    view: math.Mat4,
-    projection: math.Mat4,
+    model_view_projection: [16]f32,
+    model: [16]f32,
+    view: [16]f32,
+    projection: [16]f32,
 };

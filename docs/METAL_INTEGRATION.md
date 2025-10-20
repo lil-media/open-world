@@ -228,7 +228,7 @@ pub fn main() !void {
         const command_buffer = encoder.finish(null);
         window.device.getQueue().submit(&[_]*gpu.CommandBuffer{command_buffer});
         window.core.swap_chain.present();
-        window.pollEvents();
+        window.pollEvents(null);
     }
 }
 ```

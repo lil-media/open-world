@@ -8,13 +8,15 @@ pub const Vertex = struct {
     normal: [3]f32,
     tex_coords: [2]f32,
     ao: f32, // Ambient occlusion factor
+    block_type: terrain.BlockType,
 
-    pub fn init(pos: [3]f32, norm: [3]f32, uv: [2]f32, ambient: f32) Vertex {
+    pub fn init(pos: [3]f32, norm: [3]f32, uv: [2]f32, ambient: f32, block_type: terrain.BlockType) Vertex {
         return .{
             .position = pos,
             .normal = norm,
             .tex_coords = uv,
             .ao = ambient,
+            .block_type = block_type,
         };
     }
 };
@@ -94,6 +96,7 @@ pub const ChunkMesh = struct {
         height: f32,
         dir: FaceDirection,
         ao_values: [4]f32,
+        block_type: terrain.BlockType,
     ) !void {
         const normal = dir.getNormal();
         const base_index = @as(u32, @intCast(self.vertices.items.len));
@@ -148,7 +151,7 @@ pub const ChunkMesh = struct {
 
         // Add vertices
         for (vertices, 0..) |vert, i| {
-            try self.vertices.append(self.allocator, Vertex.init(vert, normal, uvs[i], ao_values[i]));
+            try self.vertices.append(self.allocator, Vertex.init(vert, normal, uvs[i], ao_values[i], block_type));
         }
 
         // Add indices (two triangles)
@@ -300,6 +303,7 @@ pub const GreedyMesher = struct {
 
                         // Determine face direction
                         const face_dir = getFaceDirection(axis, true);
+                        const face_block_type = block_type;
 
                         // Calculate ambient occlusion (simplified - all 1.0 for now)
                         const ao = [4]f32{ 1.0, 1.0, 1.0, 1.0 };
@@ -312,6 +316,7 @@ pub const GreedyMesher = struct {
                             quad_height,
                             face_dir,
                             ao,
+                            face_block_type,
                         );
 
                         // Clear mask for this region

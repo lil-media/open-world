@@ -13,15 +13,20 @@ A high-performance voxel-based open world building game optimized for macOS and 
 - [x] Chunk-based world system (16x16x256)
 - [x] Basic terrain editor tools
 - [x] Unit tests for core systems
+- [x] Greedy meshing algorithm (CPU-side generation)
+- [x] Priority-based chunk streaming manager (synchronous implementation)
+- [x] Camera system core (first-person + free-cam with smoothing)
+- [x] Player physics foundation (AABB collision, movement, flying)
 
 ### 🏗️ In Progress
-- [ ] Greedy meshing algorithm for rendering optimization
-- [ ] Metal graphics integration
-- [ ] Camera system implementation
+- [ ] Metal graphics integration (SDL2 + Metal bridge; pipeline setup pending)
+- [ ] GPU voxel rendering pipeline (buffer uploads, shader binding, draw loop)
+- [ ] Asynchronous chunk streaming & background meshing (thread pool + async I/O)
 
 ### 📋 Next Up
-- [ ] Asynchronous chunk streaming
-- [ ] Player physics and collision
+- [ ] Input and game state scaffolding for real-time controls
+- [ ] Mesh-to-Metal integration (upload chunk meshes, render first chunk)
+- [ ] Environmental simulation design pass (weather, fluids, temperature)
 - [ ] Network architecture foundation
 
 ## Phase Breakdown
@@ -30,22 +35,26 @@ A high-performance voxel-based open world building game optimized for macOS and 
 
 #### Week 1-2: Core Rendering
 - [ ] **Metal Integration**
-  - Install and configure Mach engine or zig-gamedev
-  - Set up Metal 4 pipeline with unified command encoder
-  - Create basic window with event loop
-  - Implement swap chain and frame synchronization
+  - [x] Decide on approach (SDL2 window + custom Metal bridge)
+  - [x] Create basic window with event loop
+  - [x] Present clear-only frame via Metal command buffer
+  - [ ] Compile and load Metal shader library from Zig build
+  - [ ] Create render pipeline and depth stencil state
+  - [ ] Implement swap chain and frame synchronization hooks
 
 - [ ] **Voxel Rendering Pipeline**
-  - Implement greedy meshing algorithm
-  - Create vertex buffer management
-  - Build face culling system
-  - Set up shader pipeline (vertex + fragment)
+  - [x] Implement greedy meshing algorithm (CPU-side)
+  - [ ] Upload chunk meshes to Metal vertex/index buffers
+  - [ ] Implement mesh cache with dirty flag tracking
+  - [ ] Wire up shader pipeline (`shaders/chunk.metal`) for world rendering
 
 #### Week 3-4: Camera & Optimization
 - [ ] **Camera System**
-  - First-person camera with mouse look
-  - Free-cam mode for creative building
-  - Smooth interpolation and controls
+  - [x] First-person camera math with yaw/pitch controls
+  - [x] Free-cam mode for creative building
+  - [x] Smooth interpolation helper (SmoothCamera)
+  - [ ] Integrate mouse/keyboard input events (SDL)
+  - [ ] Hook camera updates to player physics step
 
 - [ ] **Rendering Optimization**
   - Frustum culling implementation
@@ -57,7 +66,7 @@ A high-performance voxel-based open world building game optimized for macOS and 
 
 ---
 
-### Phase 2: Advanced Terrain (Weeks 5-7) ✅ MOSTLY COMPLETE
+### Phase 2: Advanced Terrain (Weeks 5-7) ✅ Core Systems Complete
 
 #### Week 5: Noise & Generation ✅
 - [x] 3D Simplex noise implementation
@@ -67,25 +76,26 @@ A high-performance voxel-based open world building game optimized for macOS and 
 
 #### Week 6: Terrain Features
 - [ ] **Cave Systems**
-  - 3D cave generation using density functions
-  - Stalactites and stalagmites
-  - Underground lakes and lava pools
+  - [x] 3D cave generation using density functions
+  - [ ] Stalactites and stalagmites
+  - [ ] Underground lakes and lava pools
 
 - [ ] **Ore Distribution**
-  - Clustered ore generation
-  - Different ores at different depths
-  - Vein patterns using 3D noise
+  - [ ] Clustered ore generation
+  - [ ] Different ores at different depths
+  - [ ] Vein patterns using 3D noise
 
 #### Week 7: Vegetation & Water
 - [ ] **Vegetation**
-  - Tree generation (multiple types per biome)
-  - Grass and flower placement
-  - Poisson disk sampling for natural distribution
+  - [ ] Tree generation (multiple types per biome)
+  - [ ] Grass and flower placement
+  - [ ] Poisson disk sampling for natural distribution
 
 - [ ] **Water Simulation**
-  - Water block flow mechanics
-  - Source and flowing water states
-  - Water-terrain interaction
+  - [ ] Water block flow mechanics with pressure-based spreading
+  - [ ] Source and flowing water states (rivers, waterfalls)
+  - [ ] Water-terrain interaction (erosion, saturation)
+  - [ ] Block state transitions: liquid ↔ ice based on temperature
 
 ---
 
@@ -93,15 +103,15 @@ A high-performance voxel-based open world building game optimized for macOS and 
 
 #### Week 8: Asynchronous Loading
 - [ ] **Thread Pool System**
-  - Utilize all Apple Silicon CPU cores
-  - Background chunk generation queue
-  - Priority-based loading (player direction)
+  - [ ] Utilize all Apple Silicon CPU cores
+  - [ ] Background chunk generation queue
+  - [x] Priority-based loading with synchronous work queue
 
 - [ ] **Streaming Architecture**
-  - Ring buffer chunk loading (16x16 chunks)
-  - Async mesh generation
-  - Smooth unloading with hysteresis
-  - Memory pooling for chunks
+  - [ ] Ring buffer chunk loading (16x16 chunks)
+  - [ ] Async mesh generation
+  - [ ] Smooth unloading with hysteresis
+  - [x] Memory pooling and chunk reuse
 
 #### Week 9-10: Persistence
 - [ ] **Save/Load System**
@@ -124,11 +134,11 @@ A high-performance voxel-based open world building game optimized for macOS and 
 
 #### Week 11: Player Controller
 - [ ] **Physics System**
-  - AABB collision detection
-  - Gravity and velocity
-  - Walk, sprint, jump, crouch
-  - Fly mode (creative)
-  - Step assist for single blocks
+  - [x] AABB collision detection
+  - [x] Gravity and velocity integration
+  - [x] Walk, sprint, jump, crouch controls
+  - [x] Fly mode (creative)
+  - [ ] Step assist for single blocks
 
 #### Week 12: Block Interaction
 - [ ] **Ray Casting**
@@ -180,12 +190,21 @@ A high-performance voxel-based open world building game optimized for macOS and 
   - Sun, moon, and stars
   - Sky color gradients
   - Fog rendering for atmosphere
+  - Atmospheric scattering presets per biome
 
 - [ ] **Weather System**
   - Rain and snow (biome-dependent)
   - Particle effects
   - Weather sounds
   - Cloud layer with parallax
+  - Dynamic humidity & precipitation cycles tied to biome climate
+  - Storm fronts with lightning and wind gust events
+
+- [ ] **Temperature Simulation**
+  - Ambient temperature field influenced by biome, elevation, time-of-day
+  - Seasonal variation + random cold fronts and heatwaves
+  - Heat exchange with blocks (cooling/heating surfaces, lava/snow interactions)
+  - Temperature-driven block states (water ↔ ice, snow accumulation/melt)
 
 #### Week 17: Entity System
 - [ ] **ECS Architecture**
@@ -255,43 +274,74 @@ A high-performance voxel-based open world building game optimized for macOS and 
 
 ---
 
+### Phase 7: Modding & Extensibility (Weeks 23-26)
+
+#### Week 23: Scripting Runtime Evaluation
+- [ ] **Runtime Feasibility Study**
+  - Assess embedding options for JavaScript/TypeScript runtimes (Bun, QuickJS, WASM-based JS engines)
+  - Prototype lightweight host interface (init, evaluate, shutdown) with sandbox hooks
+  - Measure baseline footprint (target <200MB resident, <100ms cold start)
+
+- [ ] **Plugin API Surface**
+  - Define world/entity events exposed to scripts (chunk load, tick, block updates)
+  - Draft permission model (read-only vs mutating hooks, rate limits)
+  - Outline hot-reload workflow for developer iteration
+
+#### Week 24-25: Prototype Integration
+- [ ] **Runtime Prototype**
+  - Implement minimal scripting host using selected runtime
+  - Expose logging, math helpers, read-only world queries
+  - Add validation tests for deterministic behavior
+
+- [ ] **Addon Packaging**
+  - Define addon manifest (metadata, versions, dependencies)
+  - CLI tooling for packaging/signing mods
+  - Sandbox filesystem and network access
+
+#### Week 26: Stabilization & Roadmap
+- [ ] **Performance Validation**
+  - Stress-test scripted mods in single-player and multiplayer sessions
+  - Profiling under heavy addon load (CPU/GPU impact)
+
+- [ ] **Design Review**
+  - Finalize public API for mod authors
+  - Draft documentation and example mods
+  - Plan long-term community distribution (workshop/registry)
+
+**Decision Point:** Select final scripting runtime (Bun if embeddable & stable, alternative JS engine otherwise)
+
+---
+
 ## Architecture Overview
 
 ```
 open-world/
 ├── src/
-│   ├── main.zig                   # Entry point, game loop
-│   ├── platform/
-│   │   ├── metal_renderer.zig     # Metal API wrapper
-│   │   ├── window.zig             # macOS window management
-│   │   └── input.zig              # Keyboard/mouse/controller input
+│   ├── main.zig                   # Entry point (runs interactive console demo)
+│   ├── demo.zig                   # Text-mode systems showcase
+│   ├── render_demo.zig            # SDL2 + Metal clear demo
+│   ├── rendering/
+│   │   ├── camera.zig             # Camera math + smoothing
+│   │   ├── mesh.zig               # Greedy meshing + chunk mesh data
+│   │   ├── metal_renderer.zig     # WIP Metal pipeline wrapper
+│   │   ├── metal.zig              # SDL Metal bridge helpers
+│   │   ├── sdl_window.zig         # SDL2 window + input polling
+│   │   ├── window.zig             # Native macOS window prototype
+│   │   └── shaders/               # Metal shader sources
 │   ├── terrain/
 │   │   ├── terrain.zig            # Chunk & block system ✅
 │   │   ├── generator.zig          # Procedural generation ✅
-│   │   ├── mesher.zig             # Greedy meshing algorithm
-│   │   ├── streaming.zig          # Async chunk loading
+│   │   ├── streaming.zig          # Priority-based chunk streaming manager
 │   │   └── editor.zig             # Terrain editing tools ✅
 │   ├── physics/
-│   │   ├── collision.zig          # AABB collision detection
-│   │   └── player.zig             # Player controller
-│   ├── rendering/
-│   │   ├── camera.zig             # Camera system
-│   │   ├── chunk_renderer.zig    # Chunk mesh rendering
-│   │   ├── lighting.zig           # Light propagation
-│   │   └── shaders/               # Metal shaders (.metal)
-│   ├── game/
-│   │   ├── inventory.zig          # Inventory management
-│   │   ├── crafting.zig           # Crafting recipes
-│   │   ├── entities.zig           # ECS implementation
-│   │   └── world.zig              # World save/load
-│   ├── network/
-│   │   ├── protocol.zig           # Network protocol
-│   │   ├── server.zig             # Server implementation
-│   │   └── client.zig             # Client networking
-│   └── utils/
+│   │   └── player.zig             # Player controller + collision
+│   ├── utils/
 │       ├── math.zig               # Vec3, Mat4, AABB, Frustum ✅
 │       ├── noise.zig              # Simplex noise, FBM ✅
-│       └── pool.zig               # Object pooling
+│       └── visualization.zig      # Text-mode diagnostics
+│   ├── game/                      # (planned) inventory/crafting systems
+│   ├── network/                   # (planned) multiplayer stack
+│   └── platform/                  # (planned) platform abstractions
 ├── assets/
 │   ├── textures/                  # Block textures (atlas)
 │   ├── shaders/                   # Metal shader source
@@ -299,7 +349,8 @@ open-world/
 │   └── recipes/                   # Crafting recipes (JSON)
 ├── build.zig                      # Build configuration ✅
 ├── README.md                      # Project overview ✅
-└── ROADMAP.md                     # This file
+├── ROADMAP.md                     # This file
+└── NEXT_STEPS.md                  # Tactical short-term plan
 ```
 
 ## Performance Targets
@@ -355,9 +406,9 @@ open-world/
 ## Testing Strategy
 
 ### Unit Tests
-- [ ] Math utilities (Vec3, Mat4, AABB) ✅
-- [ ] Noise generation (Simplex, FBM) ✅
-- [ ] Terrain generation ✅
+- [x] Math utilities (Vec3, Mat4, AABB)
+- [x] Noise generation (Simplex, FBM)
+- [x] Terrain generation (biome + cave sampling)
 - [ ] Chunk serialization
 - [ ] Collision detection
 - [ ] Inventory management
@@ -458,12 +509,14 @@ open-world/
 - [ ] 60 FPS @ 1080p on M1
 - [ ] <4GB RAM usage
 - [ ] Multiplayer 50+ players
+- [ ] Dynamic weather simulation stable within 2ms/frame budget
 
 ### Gameplay
 - [ ] Infinite procedural world
 - [ ] Smooth terrain editing
 - [ ] Full crafting system
 - [ ] Multiplayer collaboration
+- [ ] Weather and temperature affect terrain (snow, ice, crop growth)
 
 ### Quality
 - [ ] No crashes during normal gameplay

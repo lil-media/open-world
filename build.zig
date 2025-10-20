@@ -3,6 +3,8 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const skip_run = b.option(bool, "skip-run", "Skip running executables during build steps") orelse false;
+    const render_max_frames = b.option(u32, "render-max-frames", "Maximum frames before render demo auto-exits (0 = infinite)") orelse 480;
 
     const exe = b.addExecutable(.{
         .name = "open-world",
@@ -18,10 +20,15 @@ pub fn build(b: *std.Build) void {
 
     // Add macOS frameworks for Metal rendering
     if (target.result.os.tag == .macos) {
+        exe.addCSourceFile(.{
+            .file = b.path("src/rendering/metal_bridge.m"),
+            .flags = &[_][]const u8{"-fobjc-arc"},
+        });
         exe.linkFramework("Metal");
         exe.linkFramework("MetalKit");
         exe.linkFramework("QuartzCore");
         exe.linkFramework("Cocoa");
+        exe.linkFramework("Foundation");
 
         // SDL2 for window management
         exe.linkSystemLibrary("SDL2");
@@ -63,6 +70,7 @@ pub fn build(b: *std.Build) void {
         render_demo.linkFramework("MetalKit");
         render_demo.linkFramework("QuartzCore");
         render_demo.linkFramework("Cocoa");
+        render_demo.linkFramework("Foundation");
         render_demo.linkSystemLibrary("SDL2");
         render_demo.addIncludePath(.{ .cwd_relative = "/opt/homebrew/include" });
         render_demo.addLibraryPath(.{ .cwd_relative = "/opt/homebrew/lib" });
@@ -72,9 +80,17 @@ pub fn build(b: *std.Build) void {
 
     const render_run_cmd = b.addRunArtifact(render_demo);
     render_run_cmd.step.dependOn(b.getInstallStep());
+    render_run_cmd.addArgs(&[_][]const u8{
+        "--max-frames",
+        b.fmt("{d}", .{render_max_frames}),
+    });
 
     const render_step = b.step("render", "Run the rendering demo");
-    render_step.dependOn(&render_run_cmd.step);
+    if (skip_run) {
+        render_step.dependOn(b.getInstallStep());
+    } else {
+        render_step.dependOn(&render_run_cmd.step);
+    }
 
     const unit_tests = b.addTest(.{
         .root_module = b.createModule(.{
