@@ -29,8 +29,9 @@ A high-performance voxel-based open world building game optimized for macOS and 
 - [x] Debug UI (F3-style: FPS, position, chunk stats, culling info)
 
 ### 🏗️ In Progress
-- [ ] Asynchronous chunk streaming & background meshing (thread pool + async I/O)
+- [ ] Asynchronous chunk streaming & background meshing (infrastructure added, debugging needed)
 - [ ] Performance profiling and optimization
+- [ ] Async threading bugs (chunks not completing from worker threads)
 
 ### 📋 Next Up
 - [ ] GPU performance metrics (Metal Performance HUD)
@@ -86,7 +87,9 @@ A high-performance voxel-based open world building game optimized for macOS and 
 
 **Known Issues:**
 - Initial 10 seconds at 1-2 FPS due to synchronous mesh generation (blocking main thread)
-- Mesh generation needs to move to background thread pool
+- Async chunk generation infrastructure added but has threading bugs (chunks don't complete)
+- Thread pool worker not properly executing - needs debugging
+- Currently using synchronous generation for stability
 
 ---
 
