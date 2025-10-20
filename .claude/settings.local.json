@@ -4,7 +4,10 @@
       "Bash(zig build test)",
       "Bash(zig build)",
       "Bash(zig build run)",
-      "Bash(zig build render)"
+      "Bash(zig build render)",
+      "Bash(zig build render --render-max-frames=300)",
+      "Bash(zig build render -Drender-max-frames=300)",
+      "Bash(zig build render -Drender-max-frames=600)"
     ],
     "deny": [],
     "ask": []

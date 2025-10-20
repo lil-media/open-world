@@ -25,6 +25,7 @@ extern fn metal_set_mesh(
 ) bool;
 extern fn metal_set_uniforms(ctx: *anyopaque, uniforms: *const anyopaque, size: usize) bool;
 extern fn metal_draw(ctx: *anyopaque, clear_color: *const f32) bool;
+extern fn metal_set_texture(ctx: *anyopaque, data: [*]const u8, width: usize, height: usize, bytes_per_row: usize) bool;
 
 pub const MetalContext = struct {
     ctx: *anyopaque,
@@ -104,6 +105,15 @@ pub const MetalContext = struct {
     pub fn draw(self: *MetalContext, clear_color: [4]f32) !void {
         if (!metal_draw(self.ctx, &clear_color[0])) {
             return error.DrawFailed;
+        }
+    }
+
+    pub fn setTexture(self: *MetalContext, data: []const u8, width: usize, height: usize, bytes_per_row: usize) !void {
+        if (data.len == 0 or width == 0 or height == 0 or bytes_per_row == 0) {
+            return error.InvalidTextureData;
+        }
+        if (!metal_set_texture(self.ctx, data.ptr, width, height, bytes_per_row)) {
+            return error.TextureUploadFailed;
         }
     }
 };

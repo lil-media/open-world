@@ -120,4 +120,10 @@ pub const Uniforms = extern struct {
     model: [16]f32,
     view: [16]f32,
     projection: [16]f32,
+    sun_direction: [4]f32,
+    sun_color: [4]f32,
+    ambient_color: [4]f32,
+    sky_color: [4]f32,
+    camera_position: [4]f32,
+    fog_params: [4]f32,
 };

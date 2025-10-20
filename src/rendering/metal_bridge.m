@@ -4,6 +4,7 @@
 #import <Foundation/Foundation.h>
 #import <CoreFoundation/CoreFoundation.h>
 #import <string.h>
+#import <stdint.h>
 
 // Simple C API for Metal rendering from Zig
 typedef struct {
@@ -16,6 +17,8 @@ typedef struct {
     void* index_buffer;
     void* uniform_buffer;
     void* depth_state;
+    void* texture;
+    void* sampler;
     size_t vertex_stride;
     size_t index_count;
     size_t uniform_size;
@@ -60,6 +63,8 @@ MetalContext* metal_create_context(void* sdl_metal_view) {
     ctx->index_buffer = NULL;
     ctx->uniform_buffer = NULL;
     ctx->depth_state = NULL;
+    ctx->texture = NULL;
+    ctx->sampler = NULL;
     ctx->vertex_stride = 0;
     ctx->index_count = 0;
     ctx->uniform_size = 0;
@@ -75,6 +80,8 @@ void metal_destroy_context(MetalContext* ctx) {
         if (ctx->pipeline) CFRelease(ctx->pipeline);
         if (ctx->library) CFRelease(ctx->library);
         if (ctx->depth_state) CFRelease(ctx->depth_state);
+        if (ctx->texture) CFRelease(ctx->texture);
+        if (ctx->sampler) CFRelease(ctx->sampler);
         if (ctx->device) CFRelease(ctx->device);
         if (ctx->queue) CFRelease(ctx->queue);
         if (ctx->layer) CFRelease(ctx->layer);
@@ -276,6 +283,14 @@ bool metal_draw(MetalContext* ctx, const float* clear_color) {
             [encoder setVertexBuffer:uniformBuffer offset:0 atIndex:1];
             [encoder setFragmentBuffer:uniformBuffer offset:0 atIndex:0];
         }
+        if (ctx->texture) {
+            id<MTLTexture> texture = (__bridge id<MTLTexture>)ctx->texture;
+            [encoder setFragmentTexture:texture atIndex:0];
+        }
+        if (ctx->sampler) {
+            id<MTLSamplerState> sampler = (__bridge id<MTLSamplerState>)ctx->sampler;
+            [encoder setFragmentSamplerState:sampler atIndex:0];
+        }
         [encoder drawIndexedPrimitives:MTLPrimitiveTypeTriangle
                             indexCount:(NSUInteger)ctx->index_count
                              indexType:MTLIndexTypeUInt32
@@ -299,4 +314,43 @@ const char* metal_get_device_name(MetalContext* ctx) {
     if (!ctx) return "Unknown";
     id<MTLDevice> device = (__bridge id<MTLDevice>)ctx->device;
     return [[device name] UTF8String];
+}
+
+bool metal_set_texture(MetalContext* ctx, const uint8_t* data, size_t width, size_t height, size_t bytes_per_row) {
+    if (!ctx || !data || width == 0 || height == 0 || bytes_per_row == 0) {
+        return false;
+    }
+
+    id<MTLDevice> device = (__bridge id<MTLDevice>)ctx->device;
+    if (!device) return false;
+
+    MTLTextureDescriptor* descriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:(NSUInteger)width height:(NSUInteger)height mipmapped:NO];
+    descriptor.storageMode = MTLStorageModeShared;
+    descriptor.usage = MTLTextureUsageShaderRead;
+
+    id<MTLTexture> texture = [device newTextureWithDescriptor:descriptor];
+    if (!texture) {
+        NSLog(@"Failed to create texture");
+        return false;
+    }
+
+    MTLRegion region = MTLRegionMake2D(0, 0, (NSUInteger)width, (NSUInteger)height);
+    [texture replaceRegion:region mipmapLevel:0 withBytes:data bytesPerRow:(NSUInteger)bytes_per_row];
+
+    MTLSamplerDescriptor* samplerDescriptor = [[MTLSamplerDescriptor alloc] init];
+    samplerDescriptor.minFilter = MTLSamplerMinMagFilterLinear;
+    samplerDescriptor.magFilter = MTLSamplerMinMagFilterLinear;
+    samplerDescriptor.mipFilter = MTLSamplerMipFilterNotMipmapped;
+    samplerDescriptor.sAddressMode = MTLSamplerAddressModeRepeat;
+    samplerDescriptor.tAddressMode = MTLSamplerAddressModeRepeat;
+    id<MTLSamplerState> sampler = [device newSamplerStateWithDescriptor:samplerDescriptor];
+    if (!sampler) {
+        NSLog(@"Failed to create sampler state");
+        return false;
+    }
+
+    metal_release_and_assign(&ctx->texture, (__bridge_retained void*)texture);
+    metal_release_and_assign(&ctx->sampler, (__bridge_retained void*)sampler);
+
+    return true;
 }

@@ -11,6 +11,7 @@ const sdl = @import("rendering/sdl_window.zig");
 const metal = @import("rendering/metal.zig");
 const input = @import("platform/input.zig");
 const metal_renderer = @import("rendering/metal_renderer.zig");
+const textures = @import("assets/texture_gen.zig");
 
 pub const DemoOptions = struct {
     max_frames: ?u32 = null,
@@ -21,6 +22,19 @@ const CachedMesh = struct {
     indices: []u32,
     in_use: bool,
 };
+
+const MeshUpdateStats = struct {
+    changed: bool,
+    total_chunks: usize,
+    rendered_chunks: usize,
+    culled_chunks: usize,
+    total_vertices: usize,
+    total_indices: usize,
+};
+
+fn lerp(a: f32, b: f32, t: f32) f32 {
+    return math.lerp(a, b, t);
+}
 
 fn blockTypeColor(block_type: terrain.BlockType) [3]f32 {
     return switch (block_type) {
@@ -33,6 +47,17 @@ fn blockTypeColor(block_type: terrain.BlockType) [3]f32 {
     };
 }
 
+fn blockTypeAtlasTile(block_type: terrain.BlockType) [2]u32 {
+    return switch (block_type) {
+        .grass => textures.tileCoord(.grass),
+        .dirt => textures.tileCoord(.dirt),
+        .stone => textures.tileCoord(.stone),
+        .sand => textures.tileCoord(.sand),
+        .water => textures.tileCoord(.water),
+        .air => textures.tileCoord(.air),
+    };
+}
+
 fn updateGpuMeshes(
     allocator: std.mem.Allocator,
     chunk_manager: *streaming.ChunkStreamingManager,
@@ -40,9 +65,17 @@ fn updateGpuMeshes(
     mesher: *mesh.GreedyMesher,
     combined_vertices: *std.ArrayListUnmanaged(metal_renderer.Vertex),
     combined_indices: *std.ArrayListUnmanaged(u32),
-) !void {
-    combined_vertices.clearRetainingCapacity();
-    combined_indices.clearRetainingCapacity();
+    frustum: math.Frustum,
+) !MeshUpdateStats {
+    var stats = MeshUpdateStats{
+        .changed = false,
+        .total_chunks = chunk_manager.chunks.count(),
+        .rendered_chunks = 0,
+        .culled_chunks = 0,
+        .total_vertices = 0,
+        .total_indices = 0,
+    };
+    const atlas_tile_size = 1.0 / @as(f32, @floatFromInt(textures.tiles_per_row));
 
     var cache_it = mesh_cache.iterator();
     while (cache_it.next()) |entry| {
@@ -54,6 +87,29 @@ fn updateGpuMeshes(
         const key = entry.key_ptr.*;
         const chunk_ptr = entry.value_ptr.*;
 
+        // Frustum culling: Create AABB for chunk
+        const chunk_size_f32 = @as(f32, @floatFromInt(terrain.Chunk.CHUNK_SIZE));
+        const chunk_x = @as(f32, @floatFromInt(chunk_ptr.x)) * chunk_size_f32;
+        const chunk_z = @as(f32, @floatFromInt(chunk_ptr.z)) * chunk_size_f32;
+        const chunk_aabb = math.AABB.init(
+            math.Vec3.init(chunk_x, 0, chunk_z),
+            math.Vec3.init(chunk_x + chunk_size_f32, @as(f32, @floatFromInt(terrain.Chunk.CHUNK_HEIGHT)), chunk_z + chunk_size_f32),
+        );
+
+        // Skip chunks outside frustum
+        // Note: Add small margin to avoid false culling due to floating point precision
+        const margin = 2.0;
+        const expanded_aabb = math.AABB.init(
+            chunk_aabb.min.sub(math.Vec3.init(margin, margin, margin)),
+            chunk_aabb.max.add(math.Vec3.init(margin, margin, margin)),
+        );
+        if (!frustum.containsAABB(expanded_aabb)) {
+            stats.culled_chunks += 1;
+            continue;
+        }
+
+        stats.rendered_chunks += 1;
+
         var cache_entry_ptr_opt = mesh_cache.getPtr(key);
         if (cache_entry_ptr_opt == null) {
             try mesh_cache.put(key, .{
@@ -62,6 +118,7 @@ fn updateGpuMeshes(
                 .in_use = false,
             });
             cache_entry_ptr_opt = mesh_cache.getPtr(key);
+            stats.changed = true;
         }
 
         const cache_entry_ptr = cache_entry_ptr_opt.?;
@@ -70,6 +127,7 @@ fn updateGpuMeshes(
         if (chunk_ptr.modified or cache_entry.vertices.len == 0) {
             if (cache_entry.vertices.len > 0) allocator.free(cache_entry.vertices);
             if (cache_entry.indices.len > 0) allocator.free(cache_entry.indices);
+            stats.changed = true;
 
             var chunk_mesh = try mesher.generateMesh(chunk_ptr);
             defer chunk_mesh.deinit();
@@ -91,6 +149,16 @@ fn updateGpuMeshes(
                 for (chunk_mesh.vertices.items, 0..) |src_vertex, i| {
                     const base_color = blockTypeColor(src_vertex.block_type);
                     const ao = src_vertex.ao;
+                    const tile = blockTypeAtlasTile(src_vertex.block_type);
+
+                    const uv_raw_u = src_vertex.tex_coords[0];
+                    const uv_raw_v = src_vertex.tex_coords[1];
+                    const frac_u = uv_raw_u - @floor(uv_raw_u);
+                    const frac_v = uv_raw_v - @floor(uv_raw_v);
+                    const tile_base_u = @as(f32, @floatFromInt(tile[0])) * atlas_tile_size;
+                    const tile_base_v = @as(f32, @floatFromInt(tile[1])) * atlas_tile_size;
+                    const final_u = tile_base_u + frac_u * atlas_tile_size;
+                    const final_v = tile_base_v + frac_v * atlas_tile_size;
 
                     new_vertices[i] = .{
                         .position = [3]f32{
@@ -99,7 +167,7 @@ fn updateGpuMeshes(
                             origin_z + src_vertex.position[2],
                         },
                         .normal = src_vertex.normal,
-                        .tex_coord = src_vertex.tex_coords,
+                        .tex_coord = [2]f32{ final_u, final_v },
                         .color = [4]f32{
                             base_color[0] * ao,
                             base_color[1] * ao,
@@ -147,7 +215,30 @@ fn updateGpuMeshes(
             if (cached.indices.len > 0) allocator.free(cached.indices);
         }
         _ = mesh_cache.remove(key);
+        stats.changed = true;
     }
+
+    if (stats.changed or combined_vertices.items.len == 0) {
+        combined_vertices.clearRetainingCapacity();
+        combined_indices.clearRetainingCapacity();
+
+        var rebuild_it = mesh_cache.iterator();
+        while (rebuild_it.next()) |entry| {
+            const cached = entry.value_ptr.*;
+            if (cached.vertices.len == 0 or cached.indices.len == 0) continue;
+
+            const base_vertex = @as(u32, @intCast(combined_vertices.items.len));
+            try combined_vertices.appendSlice(allocator, cached.vertices);
+            try combined_indices.ensureTotalCapacity(allocator, combined_indices.items.len + cached.indices.len);
+            for (cached.indices) |idx| {
+                combined_indices.appendAssumeCapacity(base_vertex + idx);
+            }
+        }
+    }
+
+    stats.total_vertices = combined_vertices.items.len;
+    stats.total_indices = combined_indices.items.len;
+    return stats;
 }
 
 /// Console-based interactive demo (legacy)
@@ -359,6 +450,9 @@ pub fn runInteractiveDemo(allocator: std.mem.Allocator, options: DemoOptions) !v
     const vertex_entry: []const u8 = "vertex_main";
     const fragment_entry: []const u8 = "fragment_main";
     try metal_ctx.createPipeline(shader_source, vertex_entry, fragment_entry, @sizeOf(metal_renderer.Vertex));
+    var atlas = try textures.generateAtlas(allocator);
+    defer atlas.deinit(allocator);
+    try metal_ctx.setTexture(atlas.data, atlas.width, atlas.height, atlas.width * textures.channels);
 
     var mesh_cache = std.AutoHashMap(u64, CachedMesh).init(allocator);
     defer {
@@ -376,6 +470,8 @@ pub fn runInteractiveDemo(allocator: std.mem.Allocator, options: DemoOptions) !v
     defer combined_indices.deinit(allocator);
 
     const model_matrix = math.Mat4.identity();
+    var time_of_day: f32 = 0.25; // 0 = midnight, 0.25 = sunrise
+    const day_length_seconds: f32 = 120.0; // full cycle in 2 minutes
 
     while (!window.should_close) {
         input_state.beginFrame();
@@ -399,6 +495,9 @@ pub fn runInteractiveDemo(allocator: std.mem.Allocator, options: DemoOptions) !v
         const delta_seconds = @as(f64, @floatFromInt(delta_ns)) / 1_000_000_000.0;
         accumulator += delta_seconds;
         fps_timer += delta_seconds;
+
+        time_of_day += @as(f32, @floatCast(delta_seconds)) / day_length_seconds;
+        if (time_of_day >= 1.0) time_of_day -= 1.0;
 
         if (window.height != 0) {
             const aspect = @as(f32, @floatFromInt(window.width)) / @as(f32, @floatFromInt(window.height));
@@ -449,26 +548,55 @@ pub fn runInteractiveDemo(allocator: std.mem.Allocator, options: DemoOptions) !v
             accumulator -= fixed_dt_seconds;
         }
 
-        try updateGpuMeshes(allocator, &chunk_manager, &mesh_cache, &mesher, &combined_vertices, &combined_indices);
+        // Create frustum for culling
+        const view = main_camera.getViewMatrix();
+        const projection = main_camera.getProjectionMatrix();
+        const view_proj = projection.multiply(view);
+        const frustum = math.Frustum.fromMatrix(view_proj);
+
+        const mesh_stats = try updateGpuMeshes(allocator, &chunk_manager, &mesh_cache, &mesher, &combined_vertices, &combined_indices, frustum);
 
         total_frames += 1;
         fps_counter += 1;
 
-        const t = @as(f32, @floatFromInt(total_frames)) / 240.0;
-        const r = (@sin(t * 0.5) + 1.0) * 0.2;
-        const g = (@sin(t * 0.7 + 2.0) + 1.0) * 0.25;
-        const b = (@sin(t * 0.3 + 4.0) + 1.0) * 0.35;
+        const sun_theta = (time_of_day * std.math.tau) - (std.math.pi / 2.0);
+        var sun_dir_vec = math.Vec3.init(@cos(sun_theta), @sin(sun_theta), 0.25);
+        sun_dir_vec = sun_dir_vec.normalize();
+        const sun_elevation = sun_dir_vec.y;
+        const day_factor = std.math.clamp((sun_elevation + 0.05) / 1.05, 0.0, 1.0);
+        const sun_intensity = lerp(0.0, 1.0, day_factor);
+
+        const sun_color_vec = math.Vec3.init(
+            lerp(0.9, 1.0, day_factor),
+            lerp(0.55, 1.0, day_factor),
+            lerp(0.4, 0.95, day_factor),
+        ).mul(sun_intensity);
+
+        const ambient_strength = lerp(0.05, 0.35, day_factor);
+        const ambient_color_vec = math.Vec3.init(ambient_strength, ambient_strength, ambient_strength);
+
+        const sky_color_day = math.Vec3.init(0.35, 0.55, 0.9);
+        const sky_color_night = math.Vec3.init(0.02, 0.02, 0.05);
+        const sky_color_vec = math.Vec3.init(
+            lerp(sky_color_night.x, sky_color_day.x, day_factor),
+            lerp(sky_color_night.y, sky_color_day.y, day_factor),
+            lerp(sky_color_night.z, sky_color_day.z, day_factor),
+        );
 
         const has_mesh = combined_vertices.items.len > 0;
-        if (has_mesh) {
+        if (mesh_stats.changed and has_mesh) {
             try metal_ctx.setMesh(
                 std.mem.sliceAsBytes(combined_vertices.items),
                 @sizeOf(metal_renderer.Vertex),
                 combined_indices.items,
             );
+        }
 
-            const view = main_camera.getViewMatrix();
-            const projection = main_camera.getProjectionMatrix();
+        const camera_pos = main_camera.getPosition();
+        const fog_start: f32 = 40.0;
+        const fog_range: f32 = 80.0;
+
+        if (has_mesh) {
             const vp = projection.multiply(view);
             const mvp = vp.multiply(model_matrix);
 
@@ -477,23 +605,33 @@ pub fn runInteractiveDemo(allocator: std.mem.Allocator, options: DemoOptions) !v
                 .model = model_matrix.data,
                 .view = view.data,
                 .projection = projection.data,
+                .sun_direction = [4]f32{ sun_dir_vec.x, sun_dir_vec.y, sun_dir_vec.z, 0.0 },
+                .sun_color = [4]f32{ sun_color_vec.x, sun_color_vec.y, sun_color_vec.z, 1.0 },
+                .ambient_color = [4]f32{ ambient_color_vec.x, ambient_color_vec.y, ambient_color_vec.z, 1.0 },
+                .sky_color = [4]f32{ sky_color_vec.x, sky_color_vec.y, sky_color_vec.z, 1.0 },
+                .camera_position = [4]f32{ camera_pos.x, camera_pos.y, camera_pos.z, 1.0 },
+                .fog_params = [4]f32{ 0.0, fog_start, fog_range, 0.0 },
             };
 
             try metal_ctx.setUniforms(std.mem.asBytes(&uniforms));
-            try metal_ctx.draw(.{ r, g, b, 1.0 });
+            try metal_ctx.draw(.{ sky_color_vec.x, sky_color_vec.y, sky_color_vec.z, 1.0 });
         } else {
-            _ = metal_ctx.renderFrame(r, g, b);
+            _ = metal_ctx.renderFrame(sky_color_vec.x, sky_color_vec.y, sky_color_vec.z);
         }
 
         if (fps_timer >= 1.0) {
             std.debug.print(
-                "FPS ~{d: >3} | Pos ({d:.1}, {d:.1}, {d:.1}) | Chunks {d}\n",
+                "FPS ~{d: >3} | Pos ({d:.1}, {d:.1}, {d:.1}) | Chunks {d}/{d} ({d} culled) | Verts {d} Tris {d}\n",
                 .{
                     fps_counter,
                     player_physics.position.x,
                     player_physics.position.y,
                     player_physics.position.z,
-                    chunk_manager.getLoadedCount(),
+                    mesh_stats.rendered_chunks,
+                    mesh_stats.total_chunks,
+                    mesh_stats.culled_chunks,
+                    mesh_stats.total_vertices,
+                    mesh_stats.total_indices / 3,
                 },
             );
             fps_counter = 0;

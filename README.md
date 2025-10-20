@@ -4,43 +4,55 @@ A high-performance voxel-based open world building game built with Zig, optimize
 
 ## Features
 
-### Current (Phase 1)
-- **Advanced Terrain Generation**
-  - 3D Simplex noise with Fractional Brownian Motion
-  - 8 distinct biomes (plains, forest, desert, mountains, ocean, beach, tundra, savanna)
-  - 3D cave systems using density-based generation
-  - Realistic terrain features with domain warping
+### Current (Phase 1 - ⚡ 70% Complete)
 
-- **Voxel System**
-  - Chunk-based architecture (16x16x256 blocks)
-  - Multiple block types (air, dirt, grass, stone, water, sand)
-  - Efficient chunk management
+**✅ Rendering & Graphics**
+- Metal 4 graphics pipeline (SDL2 + Objective-C bridge)
+- Greedy meshing algorithm with GPU upload
+- Texture atlas system (procedural generation)
+- Vertex/index buffer management with caching
+- Frustum culling (90% chunk reduction)
+- Day/night cycle with dynamic lighting
+- Fog and atmospheric effects
+- Real-time shader-based rendering
 
-- **Terrain Editing Tools**
-  - Dig: Remove blocks with spherical brush
-  - Place: Add blocks
-  - Flatten: Smooth terrain to target height
-  - Raise/Lower: Sculpt terrain
-  - Configurable brush sizes (1-10 blocks)
+**✅ Terrain Generation**
+- 3D Simplex noise with Fractional Brownian Motion
+- 8 distinct biomes (plains, forest, desert, mountains, ocean, beach, tundra, savanna)
+- 3D cave systems using density-based generation
+- Realistic terrain features with domain warping
+- Chunk-based world (16x16x256 blocks)
+- Priority-based chunk streaming
 
-- **Math & Utilities**
-  - Vec3, Vec3i for positions and directions
-  - AABB collision detection
-  - Mat4 transformations
-  - Frustum culling support
+**✅ Player & Camera**
+- First-person and free-cam modes
+- Mouse/keyboard input handling (SDL2)
+- Player physics (AABB collision, gravity, movement)
+- Smooth camera controls with yaw/pitch
+- Sprint, jump, fly modes
 
-### Planned
-- Metal 4 graphics rendering (GPU-driven, Apple Silicon optimized)
-- Greedy meshing for efficient rendering
-- LOD system (4 tiers)
-- Asynchronous chunk streaming
-- Player physics and collision
-- Lighting system (sunlight + block lights)
-- Inventory and crafting
-- Day/night cycle and weather
-- Multiplayer support (client-server architecture)
+**✅ Debug & Tools**
+- F3-style debug overlay (FPS, position, chunks, triangles)
+- Terrain editing (dig, place, flatten, raise/lower)
+- Performance metrics display
 
-See [ROADMAP.md](ROADMAP.md) for detailed development plan.
+**📊 Performance (M3 Pro)**
+- 114 FPS @ 1280x720 (exceeds 60 FPS target)
+- 10/110 chunks rendered (90% frustum culling)
+- 444K triangles/frame (77% reduction from culling)
+
+### Planned (Next Up)
+- Asynchronous chunk generation (fix startup stutter)
+- Metal Performance HUD integration
+- Block interaction (ray casting, breaking/placing)
+- Save/Load system for world persistence
+- Advanced lighting (block lights, smooth lighting)
+- Inventory and crafting systems
+- Weather simulation and temperature
+- Multiplayer support (client-server)
+
+📖 See [ROADMAP.md](ROADMAP.md) for detailed development plan and current status.
+🤖 See [AGENTS.md](AGENTS.md) for AI agent workflow and maintenance guidelines.
 
 ## Project Structure
 
