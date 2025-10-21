@@ -31,9 +31,10 @@ A high-performance voxel-based open world building game optimized for macOS and 
 - [x] Block breaking/placing with mouse input (left/right click)
 - [x] Collision checking for block placement
 - [x] Visual block selection outline (white wireframe cube)
+- [x] Async chunk generation (dedicated worker thread, 120 FPS during load)
 
 ### 🏗️ In Progress
-- [ ] Alternative approaches for async chunk generation
+- [ ] Fix rare segfault during chunk cleanup (race condition)
 - [ ] Performance profiling and optimization
 
 ### 📋 Next Up
