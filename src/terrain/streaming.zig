@@ -95,15 +95,6 @@ pub const ChunkState = enum {
     unloading, // Being saved and removed
 };
 
-/// Task for background chunk generation
-const ChunkGenerationTask = struct {
-    manager: *ChunkStreamingManager,
-    pos: ChunkPos,
-    chunk: *terrain.Chunk,
-    terrain_gen: generator.TerrainGenerator,
-    allocator: std.mem.Allocator,
-};
-
 /// Chunk streaming manager
 pub const ChunkStreamingManager = struct {
     allocator: std.mem.Allocator,
@@ -122,12 +113,13 @@ pub const ChunkStreamingManager = struct {
     // Terrain generator
     terrain_gen: generator.TerrainGenerator,
 
-    // Async generation
-    generation_thread_pool: std.Thread.Pool,
-    generation_wait_group: std.Thread.WaitGroup,
+    // Async generation - NEW approach using dedicated worker thread
+    generation_thread: ?std.Thread,
     generation_mutex: std.Thread.Mutex,
+    generation_queue: std.ArrayList(ChunkPos), // Chunks waiting to be generated
     pending_chunks: std.AutoHashMap(u64, *terrain.Chunk), // Chunks being generated
     completed_chunks: std.ArrayList(ChunkPos), // Ready to be moved to main chunks
+    should_stop: std.atomic.Value(bool),
     use_async: bool,
 
     // Settings
@@ -138,17 +130,22 @@ pub const ChunkStreamingManager = struct {
     tracked_chunks: std.ArrayListUnmanaged(*terrain.Chunk),
 
     pub fn init(allocator: std.mem.Allocator, seed: u64, view_distance: i32) !ChunkStreamingManager {
-        // Async chunk generation disabled due to CPU starvation of worker threads
-        // Thread.Pool workers don't get CPU time when Metal rendering + game loop is active
-        // Future: Consider dedicated generation thread or chunked synchronous generation
-        return try initWithAsync(allocator, seed, view_distance, false);
+        // Use async by default with new dedicated thread approach
+        return try initWithAsync(allocator, seed, view_distance, true);
+    }
+
+    /// Start the async worker thread - must be called AFTER init, once the manager is in its final location
+    pub fn startAsyncGeneration(self: *ChunkStreamingManager) !void {
+        if (self.use_async and self.generation_thread == null) {
+            self.generation_thread = try std.Thread.spawn(.{}, generationWorkerThread, .{self});
+        }
     }
 
     pub fn initWithAsync(allocator: std.mem.Allocator, seed: u64, view_distance: i32, use_async: bool) !ChunkStreamingManager {
         const ArrayListChunk = std.ArrayList(*terrain.Chunk);
         const ArrayListChunkPos = std.ArrayList(ChunkPos);
 
-        var manager = ChunkStreamingManager{
+        const manager = ChunkStreamingManager{
             .allocator = allocator,
             .chunks = std.AutoHashMap(u64, *terrain.Chunk).init(allocator),
             .chunk_states = std.AutoHashMap(u64, ChunkState).init(allocator),
@@ -156,11 +153,12 @@ pub const ChunkStreamingManager = struct {
             .load_queue = std.PriorityQueue(ChunkRequest, void, ChunkRequest.lessThan).init(allocator, {}),
             .unload_queue = ArrayListChunkPos{},
             .terrain_gen = generator.TerrainGenerator.init(seed),
-            .generation_thread_pool = undefined,
-            .generation_wait_group = undefined,
+            .generation_thread = null,
             .generation_mutex = .{},
+            .generation_queue = ArrayListChunkPos{},
             .pending_chunks = std.AutoHashMap(u64, *terrain.Chunk).init(allocator),
             .completed_chunks = ArrayListChunkPos{},
+            .should_stop = std.atomic.Value(bool).init(false),
             .use_async = use_async,
             .view_distance = view_distance,
             .unload_distance = view_distance + 2, // Hysteresis
@@ -169,20 +167,17 @@ pub const ChunkStreamingManager = struct {
             .tracked_chunks = .{},
         };
 
-        if (use_async) {
-            // Initialize thread pool with number of CPU cores
-            try manager.generation_thread_pool.init(.{ .allocator = allocator });
-            manager.generation_wait_group.reset();
-        }
-
+        // Don't start the thread yet - it will be started after the manager is in its final location
         return manager;
     }
 
     pub fn deinit(self: *ChunkStreamingManager) void {
-        // Wait for all pending generation tasks to complete BEFORE unloading chunks
+        // Signal worker thread to stop and wait for it to finish
         if (self.use_async) {
-            // Wait for all workers to finish (they're still using chunks!)
-            self.generation_thread_pool.waitAndWork(&self.generation_wait_group);
+            self.should_stop.store(true, .seq_cst);
+            if (self.generation_thread) |thread| {
+                thread.join();
+            }
 
             // Move any final completed chunks
             self.generation_mutex.lock();
@@ -195,9 +190,20 @@ pub const ChunkStreamingManager = struct {
                     self.chunk_states.put(hash_val, .ready) catch {};
                 }
             }
-            self.generation_mutex.unlock();
 
-            self.generation_thread_pool.deinit();
+            // Clean up any remaining pending chunks that never completed
+            var it = self.pending_chunks.valueIterator();
+            while (it.next()) |chunk_ptr| {
+                const chunk = chunk_ptr.*;
+                self.removeTrackedChunk(chunk);
+                self.allocator.destroy(chunk);
+                if (self.allocated_chunks > 0) {
+                    self.allocated_chunks -= 1;
+                }
+            }
+            self.pending_chunks.clearRetainingCapacity();
+
+            self.generation_mutex.unlock();
         }
 
         self.unloadAll();
@@ -206,6 +212,7 @@ pub const ChunkStreamingManager = struct {
         self.chunk_pool.deinit(self.allocator);
         self.load_queue.deinit();
         self.unload_queue.deinit(self.allocator);
+        self.generation_queue.deinit(self.allocator);
         self.pending_chunks.deinit();
         self.completed_chunks.deinit(self.allocator);
         self.tracked_chunks.deinit(self.allocator);
@@ -334,10 +341,6 @@ pub const ChunkStreamingManager = struct {
     fn processLoading(self: *ChunkStreamingManager) !void {
         // First, collect completed async chunks (non-blocking)
         if (self.use_async) {
-            // Give worker threads a brief moment to execute (1ms)
-            // This allows background generation to progress without blocking the main thread too much
-            std.Thread.sleep(1 * std.time.ns_per_ms);
-
             self.generation_mutex.lock();
             defer self.generation_mutex.unlock();
 
@@ -359,17 +362,8 @@ pub const ChunkStreamingManager = struct {
             const request = self.load_queue.removeOrNull() orelse break;
 
             if (self.use_async) {
-                // Limit concurrent async tasks to avoid overwhelming worker threads
-                // Only spawn new tasks if we have capacity
-                const max_concurrent = 8; // Reasonable limit for background generation
-                if (self.pending_chunks.count() < max_concurrent) {
-                    try self.loadChunkAsync(request.pos);
-                } else {
-                    // Queue is full, don't spawn more tasks this frame
-                    // Put the request back for next frame
-                    try self.load_queue.add(request);
-                    break;
-                }
+                // Queue for background generation instead of generating synchronously
+                try self.queueChunkGeneration(request.pos);
             } else {
                 try self.loadChunk(request.pos);
             }
@@ -378,7 +372,7 @@ pub const ChunkStreamingManager = struct {
         }
     }
 
-    fn loadChunkAsync(self: *ChunkStreamingManager, pos: ChunkPos) !void {
+    fn queueChunkGeneration(self: *ChunkStreamingManager, pos: ChunkPos) !void {
         const hash_val = pos.hash();
 
         // Get or create chunk
@@ -391,33 +385,51 @@ pub const ChunkStreamingManager = struct {
         try self.pending_chunks.put(hash_val, chunk);
         try self.chunk_states.put(hash_val, .generating);
 
-        // Create task context
-        const task_data = try self.allocator.create(ChunkGenerationTask);
-        task_data.* = .{
-            .manager = self,
-            .pos = pos,
-            .chunk = chunk,
-            .terrain_gen = self.terrain_gen,
-            .allocator = self.allocator,
-        };
-
-        // Queue task for background generation with wait group
-        self.generation_wait_group.start();
-        try self.generation_thread_pool.spawn(chunkGenerationWorker, .{task_data});
+        // Queue position for worker thread
+        self.generation_mutex.lock();
+        defer self.generation_mutex.unlock();
+        try self.generation_queue.append(self.allocator, pos);
     }
 
-    fn chunkGenerationWorker(task: *ChunkGenerationTask) void {
-        // Generate terrain on background thread
-        task.terrain_gen.generateChunk(task.chunk);
+    /// Dedicated worker thread that continuously generates chunks
+    fn generationWorkerThread(manager: *ChunkStreamingManager) void {
+        const terrain_gen = manager.terrain_gen;
 
-        // Mark as complete
-        task.manager.generation_mutex.lock();
-        task.manager.completed_chunks.append(task.allocator, task.pos) catch {};
-        task.manager.generation_mutex.unlock();
+        while (!manager.should_stop.load(.seq_cst)) {
+            // Check if there's work to do
+            manager.generation_mutex.lock();
+            const maybe_pos = if (manager.generation_queue.items.len > 0)
+                manager.generation_queue.orderedRemove(0)
+            else
+                null;
+            manager.generation_mutex.unlock();
 
-        // Signal completion and cleanup
-        task.manager.generation_wait_group.finish();
-        task.allocator.destroy(task);
+            if (maybe_pos) |pos| {
+                const hash_val = pos.hash();
+
+                // Get the chunk from pending (and remove it so we're the only owner)
+                manager.generation_mutex.lock();
+                const maybe_chunk = manager.pending_chunks.get(hash_val);
+                manager.generation_mutex.unlock();
+
+                if (maybe_chunk) |chunk| {
+                    // Generate terrain (this is the slow part)
+                    // Do this OUTSIDE the mutex to allow other operations to proceed
+                    terrain_gen.generateChunk(chunk);
+
+                    // Mark as complete - but first check if the chunk is still in pending
+                    // (it might have been cancelled/unloaded while we were generating)
+                    manager.generation_mutex.lock();
+                    if (manager.pending_chunks.contains(hash_val)) {
+                        manager.completed_chunks.append(manager.allocator, pos) catch {};
+                    }
+                    manager.generation_mutex.unlock();
+                }
+            } else {
+                // No work - sleep briefly to avoid busy-waiting
+                std.Thread.sleep(1 * std.time.ns_per_ms);
+            }
+        }
     }
 
     fn processUnloading(self: *ChunkStreamingManager) !void {
@@ -446,6 +458,18 @@ pub const ChunkStreamingManager = struct {
 
     fn unloadChunk(self: *ChunkStreamingManager, pos: ChunkPos) !void {
         const hash_val = pos.hash();
+
+        // Don't unload chunks that are currently being generated!
+        if (self.use_async) {
+            self.generation_mutex.lock();
+            const is_generating = self.pending_chunks.contains(hash_val);
+            self.generation_mutex.unlock();
+
+            if (is_generating) {
+                // Skip unloading this chunk - it's still being generated
+                return;
+            }
+        }
 
         if (self.chunks.fetchRemove(hash_val)) |entry| {
             const chunk = entry.value;

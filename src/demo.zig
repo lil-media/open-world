@@ -528,6 +528,9 @@ pub fn runInteractiveDemo(allocator: std.mem.Allocator, options: DemoOptions) !v
     var chunk_manager = try streaming.ChunkStreamingManager.init(allocator, world_seed, view_distance);
     defer chunk_manager.deinit();
 
+    // Start async generation AFTER the manager is in its final location
+    try chunk_manager.startAsyncGeneration();
+
     // Spawn at reasonable height above terrain
     const spawn_pos = math.Vec3.init(8.0, 75.0, 8.0); // Slightly above terrain
     var player_physics = player.PlayerPhysics.init(spawn_pos);
