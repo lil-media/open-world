@@ -213,6 +213,24 @@ pub const GreedyMesher = struct {
         const max_v: usize = if (v_dim == 1) chunk_height else chunk_size;
         const max_d: usize = if (axis == 1) chunk_height else chunk_size;
 
+        // Process both positive and negative face directions
+        for ([_]bool{ false, true }) |is_positive_direction| {
+            try self.meshAxisDirection(chunk, mesh, axis, u_dim, v_dim, max_u, max_v, max_d, is_positive_direction);
+        }
+    }
+
+    fn meshAxisDirection(
+        self: *GreedyMesher,
+        chunk: *const terrain.Chunk,
+        mesh: *ChunkMesh,
+        axis: usize,
+        u_dim: usize,
+        v_dim: usize,
+        max_u: usize,
+        max_v: usize,
+        max_d: usize,
+        is_positive_direction: bool,
+    ) !void {
         // Mask for identifying matching faces
         var mask = try self.allocator.alloc(?terrain.BlockType, max_u * max_v);
         defer self.allocator.free(mask);
@@ -237,8 +255,8 @@ pub const GreedyMesher = struct {
                     // Skip air blocks
                     if (block.block_type == .air) continue;
 
-                    // Check if face should be rendered (neighbor is air or transparent)
-                    const should_render_positive = blk: {
+                    // Check if face should be rendered based on direction
+                    const should_render = if (is_positive_direction) blk: {
                         if (d + 1 >= max_d) break :blk true;
 
                         var neighbor_pos = pos;
@@ -246,9 +264,7 @@ pub const GreedyMesher = struct {
 
                         const neighbor = chunk.getBlock(neighbor_pos[0], neighbor_pos[2], neighbor_pos[1]);
                         break :blk neighbor == null or neighbor.?.block_type == .air or !neighbor.?.isSolid();
-                    };
-
-                    const should_render_negative = blk: {
+                    } else blk: {
                         if (d == 0) break :blk true;
 
                         var neighbor_pos = pos;
@@ -259,7 +275,7 @@ pub const GreedyMesher = struct {
                     };
 
                     // Store in mask if face should be rendered
-                    if (should_render_positive or should_render_negative) {
+                    if (should_render) {
                         mask[u * max_v + v] = block.block_type;
                     }
                 }
@@ -301,8 +317,8 @@ pub const GreedyMesher = struct {
                         const quad_width: f32 = @floatFromInt(width);
                         const quad_height: f32 = @floatFromInt(height);
 
-                        // Determine face direction
-                        const face_dir = getFaceDirection(axis, true);
+                        // Determine face direction based on which side we're processing
+                        const face_dir = getFaceDirection(axis, is_positive_direction);
                         const face_block_type = block_type;
 
                         // Calculate ambient occlusion (simplified - all 1.0 for now)
