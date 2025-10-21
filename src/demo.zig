@@ -12,6 +12,7 @@ const metal = @import("rendering/metal.zig");
 const input = @import("platform/input.zig");
 const metal_renderer = @import("rendering/metal_renderer.zig");
 const textures = @import("assets/texture_gen.zig");
+const raycast = @import("utils/raycast.zig");
 
 pub const DemoOptions = struct {
     max_frames: ?u32 = null,
@@ -34,6 +35,114 @@ const MeshUpdateStats = struct {
 
 fn lerp(a: f32, b: f32, t: f32) f32 {
     return math.lerp(a, b, t);
+}
+
+/// Helper to get a block from the world at global coordinates
+fn getBlockAt(chunk_manager: *streaming.ChunkStreamingManager, x: i32, y: i32, z: i32) ?terrain.BlockType {
+    // Check bounds
+    if (y < 0 or y >= terrain.Chunk.CHUNK_HEIGHT) {
+        return .air;
+    }
+
+    // Convert to chunk coordinates
+    const chunk_x = @divFloor(x, terrain.Chunk.CHUNK_SIZE);
+    const chunk_z = @divFloor(z, terrain.Chunk.CHUNK_SIZE);
+    const chunk_pos = streaming.ChunkPos.init(chunk_x, chunk_z);
+
+    // Get chunk
+    const chunk = chunk_manager.getChunk(chunk_pos) orelse return .air;
+
+    // Convert to local coordinates
+    const local_x: usize = @intCast(@mod(x, terrain.Chunk.CHUNK_SIZE));
+    const local_z: usize = @intCast(@mod(z, terrain.Chunk.CHUNK_SIZE));
+    const local_y: usize = @intCast(y);
+
+    // Get block
+    const block = chunk.getBlock(local_x, local_z, local_y) orelse return .air;
+    return block.block_type;
+}
+
+/// Set a block in the world at global coordinates
+fn setBlockAt(chunk_manager: *streaming.ChunkStreamingManager, x: i32, y: i32, z: i32, block_type: terrain.BlockType) bool {
+    // Check bounds
+    if (y < 0 or y >= terrain.Chunk.CHUNK_HEIGHT) {
+        return false;
+    }
+
+    // Convert to chunk coordinates
+    const chunk_x = @divFloor(x, terrain.Chunk.CHUNK_SIZE);
+    const chunk_z = @divFloor(z, terrain.Chunk.CHUNK_SIZE);
+    const chunk_pos = streaming.ChunkPos.init(chunk_x, chunk_z);
+
+    // Get chunk
+    const chunk = chunk_manager.getChunk(chunk_pos) orelse return false;
+
+    // Convert to local coordinates
+    const local_x: usize = @intCast(@mod(x, terrain.Chunk.CHUNK_SIZE));
+    const local_z: usize = @intCast(@mod(z, terrain.Chunk.CHUNK_SIZE));
+    const local_y: usize = @intCast(y);
+
+    // Set block
+    return chunk.setBlock(local_x, local_z, local_y, terrain.Block.init(block_type));
+}
+
+/// Generate vertices for a wireframe cube outline
+fn generateCubeOutlineVertices(allocator: std.mem.Allocator, pos: math.Vec3i, offset: f32) ![]metal_renderer.Vertex {
+    const x = @as(f32, @floatFromInt(pos.x)) - offset;
+    const y = @as(f32, @floatFromInt(pos.y)) - offset;
+    const z = @as(f32, @floatFromInt(pos.z)) - offset;
+    const size = 1.0 + offset * 2.0;
+
+    // Define 8 corners of the cube
+    const corners = [8][3]f32{
+        [3]f32{ x, y, z }, // 0: bottom-back-left
+        [3]f32{ x + size, y, z }, // 1: bottom-back-right
+        [3]f32{ x + size, y, z + size }, // 2: bottom-front-right
+        [3]f32{ x, y, z + size }, // 3: bottom-front-left
+        [3]f32{ x, y + size, z }, // 4: top-back-left
+        [3]f32{ x + size, y + size, z }, // 5: top-back-right
+        [3]f32{ x + size, y + size, z + size }, // 6: top-front-right
+        [3]f32{ x, y + size, z + size }, // 7: top-front-left
+    };
+
+    // 12 edges, 2 vertices each = 24 vertices
+    const white = [4]f32{ 1.0, 1.0, 1.0, 1.0 };
+    const normal = [3]f32{ 0.0, 1.0, 0.0 };
+    const uv = [2]f32{ 0.0, 0.0 };
+
+    var vertices = try allocator.alloc(metal_renderer.Vertex, 24);
+
+    // Bottom edges
+    vertices[0] = .{ .position = corners[0], .normal = normal, .tex_coord = uv, .color = white };
+    vertices[1] = .{ .position = corners[1], .normal = normal, .tex_coord = uv, .color = white };
+    vertices[2] = .{ .position = corners[1], .normal = normal, .tex_coord = uv, .color = white };
+    vertices[3] = .{ .position = corners[2], .normal = normal, .tex_coord = uv, .color = white };
+    vertices[4] = .{ .position = corners[2], .normal = normal, .tex_coord = uv, .color = white };
+    vertices[5] = .{ .position = corners[3], .normal = normal, .tex_coord = uv, .color = white };
+    vertices[6] = .{ .position = corners[3], .normal = normal, .tex_coord = uv, .color = white };
+    vertices[7] = .{ .position = corners[0], .normal = normal, .tex_coord = uv, .color = white };
+
+    // Top edges
+    vertices[8] = .{ .position = corners[4], .normal = normal, .tex_coord = uv, .color = white };
+    vertices[9] = .{ .position = corners[5], .normal = normal, .tex_coord = uv, .color = white };
+    vertices[10] = .{ .position = corners[5], .normal = normal, .tex_coord = uv, .color = white };
+    vertices[11] = .{ .position = corners[6], .normal = normal, .tex_coord = uv, .color = white };
+    vertices[12] = .{ .position = corners[6], .normal = normal, .tex_coord = uv, .color = white };
+    vertices[13] = .{ .position = corners[7], .normal = normal, .tex_coord = uv, .color = white };
+    vertices[14] = .{ .position = corners[7], .normal = normal, .tex_coord = uv, .color = white };
+    vertices[15] = .{ .position = corners[4], .normal = normal, .tex_coord = uv, .color = white };
+
+    // Vertical edges
+    vertices[16] = .{ .position = corners[0], .normal = normal, .tex_coord = uv, .color = white };
+    vertices[17] = .{ .position = corners[4], .normal = normal, .tex_coord = uv, .color = white };
+    vertices[18] = .{ .position = corners[1], .normal = normal, .tex_coord = uv, .color = white };
+    vertices[19] = .{ .position = corners[5], .normal = normal, .tex_coord = uv, .color = white };
+    vertices[20] = .{ .position = corners[2], .normal = normal, .tex_coord = uv, .color = white };
+    vertices[21] = .{ .position = corners[6], .normal = normal, .tex_coord = uv, .color = white };
+    vertices[22] = .{ .position = corners[3], .normal = normal, .tex_coord = uv, .color = white };
+    vertices[23] = .{ .position = corners[7], .normal = normal, .tex_coord = uv, .color = white };
+
+    return vertices;
 }
 
 fn blockTypeColor(block_type: terrain.BlockType) [3]f32 {
@@ -427,10 +536,9 @@ pub fn runInteractiveDemo(allocator: std.mem.Allocator, options: DemoOptions) !v
     var main_camera = camera.Camera.init(player_physics.getEyePosition(), 16.0 / 9.0);
     main_camera.setMode(.free_cam);
 
-    // Look down more steeply to see terrain below
-    main_camera.pitch = -0.6; // Look down about 34 degrees
+    // Look down slightly to see terrain
+    main_camera.pitch = -0.3; // Look down about 17 degrees
     main_camera.updateVectors();
-
 
     var last_time: i128 = std.time.nanoTimestamp();
     var accumulator: f64 = 0;
@@ -441,7 +549,10 @@ pub fn runInteractiveDemo(allocator: std.mem.Allocator, options: DemoOptions) !v
     var fps_counter: u32 = 0;
     var fps_timer: f64 = 0;
 
-    std.debug.print("Controls: WASD move, Space/Ctrl up/down (fly), Shift sprint, F toggle fly, ESC quit.\n", .{});
+    std.debug.print("Controls:\n", .{});
+    std.debug.print("  Movement: WASD, Space/Ctrl (fly up/down), Shift (sprint), F (toggle fly)\n", .{});
+    std.debug.print("  Blocks: Left Click (break), Right Click (place)\n", .{});
+    std.debug.print("  ESC to quit\n", .{});
 
     try chunk_manager.update(player_physics.position, main_camera.front);
 
@@ -476,6 +587,9 @@ pub fn runInteractiveDemo(allocator: std.mem.Allocator, options: DemoOptions) !v
     var time_of_day: f32 = 0.25; // 0 = midnight, 0.25 = sunrise
     const day_length_seconds: f32 = 120.0; // full cycle in 2 minutes
 
+    // Track selected block for outline rendering
+    var selected_block: ?raycast.RaycastHit = null;
+
     while (!window.should_close) {
         input_state.beginFrame();
         window.pollEvents(&input_state);
@@ -508,6 +622,70 @@ pub fn runInteractiveDemo(allocator: std.mem.Allocator, options: DemoOptions) !v
         }
 
         main_camera.processMouseMovement(input_state.mouse_delta.x, input_state.mouse_delta.y);
+
+        // Block interaction - ray cast from camera
+        const GetBlockFn = struct {
+            fn get(chunk_mgr: *streaming.ChunkStreamingManager, x: i32, y: i32, z: i32) ?terrain.BlockType {
+                return getBlockAt(chunk_mgr, x, y, z);
+            }
+        }.get;
+
+        const ray_origin = main_camera.getPosition();
+        const ray_direction = main_camera.getFront();
+        const max_reach = 5.0; // 5 blocks reach distance
+
+        const hit = raycast.raycast(
+            ray_origin,
+            ray_direction,
+            max_reach,
+            &chunk_manager,
+            GetBlockFn,
+        );
+
+        // Store selected block for outline rendering
+        selected_block = if (hit.hit) hit else null;
+
+        // Show what block you're looking at (every 30 frames to avoid spam)
+        if (hit.hit and total_frames % 30 == 0) {
+            const block_type = getBlockAt(&chunk_manager, hit.block_pos.x, hit.block_pos.y, hit.block_pos.z) orelse .air;
+            std.debug.print("→ Looking at: {s} at ({d}, {d}, {d}) distance {d:.1}m\n", .{
+                @tagName(block_type),
+                hit.block_pos.x,
+                hit.block_pos.y,
+                hit.block_pos.z,
+                hit.distance,
+            });
+        }
+
+        // Handle block breaking (left click)
+        if (hit.hit and input_state.wasMousePressed(.left)) {
+            const bx = hit.block_pos.x;
+            const by = hit.block_pos.y;
+            const bz = hit.block_pos.z;
+            const block_type = getBlockAt(&chunk_manager, bx, by, bz) orelse .air;
+            _ = setBlockAt(&chunk_manager, bx, by, bz, .air);
+            std.debug.print("💥 Broke {s} at ({d}, {d}, {d})\n", .{ @tagName(block_type), bx, by, bz });
+        }
+
+        // Handle block placing (right click)
+        if (hit.hit and input_state.wasMousePressed(.right)) {
+            // Place block on the face that was hit
+            const place_x = hit.block_pos.x + hit.face_normal.x;
+            const place_y = hit.block_pos.y + hit.face_normal.y;
+            const place_z = hit.block_pos.z + hit.face_normal.z;
+
+            // Check if player would collide with placed block
+            const place_pos = math.Vec3.init(@as(f32, @floatFromInt(place_x)) + 0.5, @as(f32, @floatFromInt(place_y)) + 0.5, @as(f32, @floatFromInt(place_z)) + 0.5);
+            const player_aabb = math.AABB.fromCenter(player_physics.position, math.Vec3.init(0.4, 0.9, 0.4));
+            const block_aabb = math.AABB.fromCenter(place_pos, math.Vec3.init(0.5, 0.5, 0.5));
+
+            if (!player_aabb.intersects(block_aabb)) {
+                _ = setBlockAt(&chunk_manager, place_x, place_y, place_z, .stone);
+                std.debug.print("🔨 Placed stone at ({d}, {d}, {d})\n", .{ place_x, place_y, place_z });
+            } else {
+                std.debug.print("❌ Can't place block - would intersect player!\n", .{});
+            }
+        }
 
         while (accumulator >= fixed_dt_seconds) {
             const dt_f32: f32 = fixed_dt;
@@ -602,7 +780,6 @@ pub fn runInteractiveDemo(allocator: std.mem.Allocator, options: DemoOptions) !v
         if (has_mesh) {
             const vp = projection.multiply(view);
             const mvp = vp.multiply(model_matrix);
-
 
             var uniforms = metal_renderer.Uniforms{
                 .model_view_projection = mvp.data,

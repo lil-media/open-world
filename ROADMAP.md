@@ -27,15 +27,18 @@ A high-performance voxel-based open world building game optimized for macOS and 
 - [x] Fog rendering and atmospheric effects
 - [x] Frustum culling (90% chunk culling efficiency)
 - [x] Debug UI (F3-style: FPS, position, chunk stats, culling info)
+- [x] Ray casting system (DDA algorithm for block selection)
+- [x] Block breaking/placing with mouse input (left/right click)
+- [x] Collision checking for block placement
 
 ### 🏗️ In Progress
-- [ ] Performance profiling and optimization
+- [ ] Visual block selection outline (wireframe rendering)
 - [ ] Alternative approaches for async chunk generation
 
 ### 📋 Next Up
 - [ ] GPU performance metrics (Metal Performance HUD)
 - [ ] Async mesh generation to eliminate startup stutter
-- [ ] Block interaction (ray casting, breaking/placing)
+- [ ] Multi-block selection and copy/paste tools
 - [ ] Save/Load system for world persistence
 - [ ] Environmental simulation design pass (weather, fluids, temperature)
 
@@ -174,17 +177,19 @@ A high-performance voxel-based open world building game optimized for macOS and 
   - [x] Fly mode (creative)
   - [ ] Step assist for single blocks
 
-#### Week 12: Block Interaction
-- [ ] **Ray Casting**
-  - Block selection with visual outline
-  - Reach distance (5 blocks)
-  - Accurate face detection
+#### Week 12: Block Interaction ⚡ IN PROGRESS
+- [x] **Ray Casting**
+  - [x] DDA algorithm implementation
+  - [x] Block selection (5 blocks reach distance)
+  - [x] Accurate face detection with face normals
 
 - [ ] **Block Breaking/Placing**
-  - Break animation with progress
-  - Tool effectiveness system
-  - Block placement with collision check
-  - Item drop system
+  - [x] Instant block breaking (left click)
+  - [x] Block placement with collision check (right click)
+  - [ ] Visual selection outline (wireframe cube)
+  - [ ] Break animation with progress
+  - [ ] Tool effectiveness system
+  - [ ] Item drop system
 
 #### Week 13: Inventory
 - [ ] **Inventory System**
