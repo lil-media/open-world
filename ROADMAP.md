@@ -29,9 +29,8 @@ A high-performance voxel-based open world building game optimized for macOS and 
 - [x] Debug UI (F3-style: FPS, position, chunk stats, culling info)
 
 ### 🏗️ In Progress
-- [ ] Asynchronous chunk streaming & background meshing (infrastructure added, debugging needed)
 - [ ] Performance profiling and optimization
-- [ ] Async threading bugs (chunks not completing from worker threads)
+- [ ] Alternative approaches for async chunk generation
 
 ### 📋 Next Up
 - [ ] GPU performance metrics (Metal Performance HUD)
@@ -87,9 +86,13 @@ A high-performance voxel-based open world building game optimized for macOS and 
 
 **Known Issues:**
 - Initial 10 seconds at 1-2 FPS due to synchronous mesh generation (blocking main thread)
-- Async chunk generation infrastructure added but has threading bugs (chunks don't complete)
-- Thread pool worker not properly executing - needs debugging
-- Currently using synchronous generation for stability
+- Thread.Pool async generation suffers from CPU starvation:
+  - Metal rendering + game loop monopolizes CPU time
+  - Worker threads don't get scheduled by macOS, preventing chunk completion
+  - Thread.Pool.spawn() successfully queues tasks but workers don't execute
+  - Tested alternative: 1ms sleep per frame helps but insufficient for chunk generation workload
+  - Infrastructure complete (WaitGroup, worker function, mutex, queues) but disabled
+  - Future: Consider dedicated generation thread or chunked synchronous generation
 
 ---
 
