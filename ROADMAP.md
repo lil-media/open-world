@@ -78,11 +78,15 @@ A high-performance voxel-based open world building game optimized for macOS and 
 **Performance Target:** 60 FPS @ 1080p, 8-chunk render distance
 **Current Performance:** ✅ 114 FPS @ 1280x720 on M3 Pro (exceeds target!)
 
-**Recent Optimizations (2025-10-20):**
+**Recent Optimizations (2025-10-21):**
+- **CRITICAL FIX:** Corrected Mat4 column-major multiplication in math.zig
+  - Bug was treating matrices as row-major, causing incorrect transformations
+  - All geometry was being placed outside viewport despite correct world positions
+  - Fix enables proper rendering with full lighting and texture support
 - Frustum culling: 90% chunk reduction (110 → 10 chunks rendered)
-- Triangle count: 77% reduction (1.9M → 444K triangles/frame)
+- Triangle count: 77% reduction (1.9M → 444K triangles/frame)  
 - FPS improvement: +15% (100 → 114 FPS)
-- Debug stats: Added F3-style overlay with chunk/vertex/triangle counts
+- Terrain now fully visible with procedural generation, lighting, and fog effects
 
 **Known Issues:**
 - Initial 10 seconds at 1-2 FPS due to synchronous mesh generation (blocking main thread)
@@ -556,6 +560,6 @@ open-world/
 
 ---
 
-**Last Updated:** 2025-10-19
+**Last Updated:** 2025-10-21
 **Version:** 1.0
 **Status:** Phase 1 - Foundation in Progress
