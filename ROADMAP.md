@@ -30,10 +30,11 @@ A high-performance voxel-based open world building game optimized for macOS and 
 - [x] Ray casting system (DDA algorithm for block selection)
 - [x] Block breaking/placing with mouse input (left/right click)
 - [x] Collision checking for block placement
+- [x] Visual block selection outline (white wireframe cube)
 
 ### 🏗️ In Progress
-- [ ] Visual block selection outline (wireframe rendering)
 - [ ] Alternative approaches for async chunk generation
+- [ ] Performance profiling and optimization
 
 ### 📋 Next Up
 - [ ] GPU performance metrics (Metal Performance HUD)
@@ -186,7 +187,7 @@ A high-performance voxel-based open world building game optimized for macOS and 
 - [ ] **Block Breaking/Placing**
   - [x] Instant block breaking (left click)
   - [x] Block placement with collision check (right click)
-  - [ ] Visual selection outline (wireframe cube)
+  - [x] Visual selection outline (white wireframe cube, 0.01 offset)
   - [ ] Break animation with progress
   - [ ] Tool effectiveness system
   - [ ] Item drop system
