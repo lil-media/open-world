@@ -25,6 +25,7 @@ extern fn metal_set_mesh(
 ) bool;
 extern fn metal_set_uniforms(ctx: *anyopaque, uniforms: *const anyopaque, size: usize) bool;
 extern fn metal_draw(ctx: *anyopaque, clear_color: *const f32) bool;
+extern fn metal_set_line_mesh(ctx: *anyopaque, vertices: *const anyopaque, vertex_count: usize, vertex_stride: usize) bool;
 extern fn metal_set_texture(ctx: *anyopaque, data: [*]const u8, width: usize, height: usize, bytes_per_row: usize) bool;
 
 pub const MetalContext = struct {
@@ -105,6 +106,21 @@ pub const MetalContext = struct {
     pub fn draw(self: *MetalContext, clear_color: [4]f32) !void {
         if (!metal_draw(self.ctx, &clear_color[0])) {
             return error.DrawFailed;
+        }
+    }
+
+    pub fn setLineMesh(self: *MetalContext, vertex_data: []const u8, vertex_stride: usize) !void {
+        if (vertex_data.len == 0) {
+            // Clear line mesh - pass dummy pointer but 0 count
+            const dummy: u8 = 0;
+            _ = metal_set_line_mesh(self.ctx, &dummy, 0, vertex_stride);
+            return;
+        }
+        if (vertex_stride == 0) return error.InvalidMeshData;
+        if (vertex_data.len % vertex_stride != 0) return error.InvalidMeshData;
+        const vertex_count = vertex_data.len / vertex_stride;
+        if (!metal_set_line_mesh(self.ctx, vertex_data.ptr, vertex_count, vertex_stride)) {
+            return error.LineMeshUploadFailed;
         }
     }
 

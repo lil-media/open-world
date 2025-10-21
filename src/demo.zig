@@ -794,6 +794,19 @@ pub fn runInteractiveDemo(allocator: std.mem.Allocator, options: DemoOptions) !v
                 .fog_params = [4]f32{ 0.0, fog_start, fog_range, 0.0 },
             };
 
+            // Set up line mesh for block selection outline if a block is selected
+            if (selected_block) |sel| {
+                const outline_vertices = try generateCubeOutlineVertices(allocator, sel.block_pos, 0.01);
+                defer allocator.free(outline_vertices);
+                try metal_ctx.setLineMesh(
+                    std.mem.sliceAsBytes(outline_vertices),
+                    @sizeOf(metal_renderer.Vertex),
+                );
+            } else {
+                // Clear line mesh
+                try metal_ctx.setLineMesh(&[_]u8{}, @sizeOf(metal_renderer.Vertex));
+            }
+
             try metal_ctx.setUniforms(std.mem.asBytes(&uniforms));
             try metal_ctx.draw(.{ sky_color_vec.x, sky_color_vec.y, sky_color_vec.z, 1.0 });
         } else {

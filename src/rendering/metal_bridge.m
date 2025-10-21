@@ -19,9 +19,11 @@ typedef struct {
     void* depth_state;
     void* texture;
     void* sampler;
+    void* line_buffer;
     size_t vertex_stride;
     size_t index_count;
     size_t uniform_size;
+    size_t line_vertex_count;
 } MetalContext;
 
 MetalContext* metal_create_context(void* sdl_metal_view) {
@@ -65,9 +67,11 @@ MetalContext* metal_create_context(void* sdl_metal_view) {
     ctx->depth_state = NULL;
     ctx->texture = NULL;
     ctx->sampler = NULL;
+    ctx->line_buffer = NULL;
     ctx->vertex_stride = 0;
     ctx->index_count = 0;
     ctx->uniform_size = 0;
+    ctx->line_vertex_count = 0;
 
     return ctx;
 }
@@ -77,6 +81,7 @@ void metal_destroy_context(MetalContext* ctx) {
         if (ctx->uniform_buffer) CFRelease(ctx->uniform_buffer);
         if (ctx->index_buffer) CFRelease(ctx->index_buffer);
         if (ctx->vertex_buffer) CFRelease(ctx->vertex_buffer);
+        if (ctx->line_buffer) CFRelease(ctx->line_buffer);
         if (ctx->pipeline) CFRelease(ctx->pipeline);
         if (ctx->library) CFRelease(ctx->library);
         if (ctx->depth_state) CFRelease(ctx->depth_state);
@@ -323,6 +328,17 @@ bool metal_draw(MetalContext* ctx, const float* clear_color) {
                              indexType:MTLIndexTypeUInt32
                            indexBuffer:indexBuffer
                      indexBufferOffset:0];
+
+        // Draw lines if line buffer is set
+        id<MTLBuffer> lineBuffer = ctx->line_buffer ? (__bridge id<MTLBuffer>)ctx->line_buffer : nil;
+        if (lineBuffer && ctx->line_vertex_count > 0) {
+            [encoder setVertexBuffer:lineBuffer offset:0 atIndex:0];
+            if (uniformBuffer) {
+                [encoder setVertexBuffer:uniformBuffer offset:0 atIndex:1];
+                [encoder setFragmentBuffer:uniformBuffer offset:0 atIndex:0];
+            }
+            [encoder drawPrimitives:MTLPrimitiveTypeLine vertexStart:0 vertexCount:(NSUInteger)ctx->line_vertex_count];
+        }
     } else {
         // DEBUG: Log why we're not drawing
         static int skip_count = 0;
@@ -349,6 +365,30 @@ const char* metal_get_device_name(MetalContext* ctx) {
     if (!ctx) return "Unknown";
     id<MTLDevice> device = (__bridge id<MTLDevice>)ctx->device;
     return [[device name] UTF8String];
+}
+
+bool metal_set_line_mesh(MetalContext* ctx, const void* vertices, size_t vertex_count, size_t vertex_stride) {
+    if (!ctx || !vertices || vertex_count == 0) {
+        // Clear line buffer if no vertices
+        if (ctx->line_buffer) {
+            CFRelease(ctx->line_buffer);
+            ctx->line_buffer = NULL;
+        }
+        ctx->line_vertex_count = 0;
+        return true;
+    }
+
+    id<MTLDevice> device = (__bridge id<MTLDevice>)ctx->device;
+    if (!device) return false;
+
+    NSUInteger vertex_length = (NSUInteger)(vertex_count * vertex_stride);
+    id<MTLBuffer> lineBuffer = [device newBufferWithBytes:vertices length:vertex_length options:MTLResourceStorageModeShared];
+    if (!lineBuffer) return false;
+
+    metal_release_and_assign(&ctx->line_buffer, (__bridge_retained void*)lineBuffer);
+    ctx->line_vertex_count = vertex_count;
+
+    return true;
 }
 
 bool metal_set_texture(MetalContext* ctx, const uint8_t* data, size_t width, size_t height, size_t bytes_per_row) {
