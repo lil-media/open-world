@@ -123,9 +123,10 @@ bool metal_create_pipeline(MetalContext* ctx, const char* source, size_t source_
     id<MTLFunction> vertexFunction = [library newFunctionWithName:vertexString];
     id<MTLFunction> fragmentFunction = [library newFunctionWithName:fragmentString];
     if (!vertexFunction || !fragmentFunction) {
-        NSLog(@"Failed to find shader entry points.");
+        NSLog(@"Failed to find shader entry points. vertex=%p, fragment=%p", vertexFunction, fragmentFunction);
         return false;
     }
+    // Shaders loaded successfully
 
     MTLRenderPipelineDescriptor* descriptor = [[MTLRenderPipelineDescriptor alloc] init];
     descriptor.vertexFunction = vertexFunction;
@@ -271,13 +272,31 @@ bool metal_draw(MetalContext* ctx, const float* clear_color) {
     id<MTLBuffer> uniformBuffer = ctx->uniform_buffer ? (__bridge id<MTLBuffer>)ctx->uniform_buffer : nil;
 
     if (pipeline && vertexBuffer && indexBuffer && ctx->index_count > 0) {
+        static int setup_count = 0;
+        if (setup_count < 3) {
+            NSLog(@"DEBUG Metal: Setting pipeline state - pipeline=%p, depthState=%p",
+                  (__bridge void*)pipeline, ctx->depth_state);
+            setup_count++;
+        }
         [encoder setRenderPipelineState:pipeline];
         if (ctx->depth_state) {
             id<MTLDepthStencilState> depthState = (__bridge id<MTLDepthStencilState>)ctx->depth_state;
             [encoder setDepthStencilState:depthState];
         }
+
+        // Set viewport - CRITICAL for rendering!
+        MTLViewport viewport = {
+            .originX = 0,
+            .originY = 0,
+            .width = (double)drawable.texture.width,
+            .height = (double)drawable.texture.height,
+            .znear = 0.0,
+            .zfar = 1.0
+        };
+        [encoder setViewport:viewport];
+
         [encoder setFrontFacingWinding:MTLWindingCounterClockwise];
-        [encoder setCullMode:MTLCullModeBack];
+        [encoder setCullMode:MTLCullModeNone]; // DEBUG: Disable backface culling
         [encoder setVertexBuffer:vertexBuffer offset:0 atIndex:0];
         if (uniformBuffer) {
             [encoder setVertexBuffer:uniformBuffer offset:0 atIndex:1];
@@ -291,11 +310,27 @@ bool metal_draw(MetalContext* ctx, const float* clear_color) {
             id<MTLSamplerState> sampler = (__bridge id<MTLSamplerState>)ctx->sampler;
             [encoder setFragmentSamplerState:sampler atIndex:0];
         }
+        // DEBUG: Log draw call
+        static int frame_count = 0;
+        if (frame_count < 3) {
+            NSLog(@"DEBUG Metal: Drawing %zu triangles, viewport=%.0fx%.0f",
+                  ctx->index_count / 3, viewport.width, viewport.height);
+            frame_count++;
+        }
+
         [encoder drawIndexedPrimitives:MTLPrimitiveTypeTriangle
                             indexCount:(NSUInteger)ctx->index_count
                              indexType:MTLIndexTypeUInt32
                            indexBuffer:indexBuffer
                      indexBufferOffset:0];
+    } else {
+        // DEBUG: Log why we're not drawing
+        static int skip_count = 0;
+        if (skip_count < 3) {
+            NSLog(@"DEBUG Metal: NOT drawing - pipeline=%p, vb=%p, ib=%p, count=%zu",
+                  (__bridge void*)pipeline, (__bridge void*)vertexBuffer, (__bridge void*)indexBuffer, ctx->index_count);
+            skip_count++;
+        }
     }
 
     [encoder endEncoding];

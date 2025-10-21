@@ -56,7 +56,7 @@ pub const Camera = struct {
     }
 
     /// Update camera vectors based on Euler angles
-    fn updateVectors(self: *Camera) void {
+    pub fn updateVectors(self: *Camera) void {
         // Calculate front vector
         const cos_pitch = @cos(self.pitch);
         const sin_pitch = @sin(self.pitch);

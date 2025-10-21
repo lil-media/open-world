@@ -264,13 +264,15 @@ pub const Mat4 = struct {
 
     pub fn multiply(self: Mat4, other: Mat4) Mat4 {
         var result = Mat4{ .data = [_]f32{0} ** 16 };
-        for (0..4) |i| {
-            for (0..4) |j| {
+        // Column-major matrix multiplication: result[col][row] = sum(self[k][row] * other[col][k])
+        for (0..4) |col| {
+            for (0..4) |row| {
                 var sum: f32 = 0;
                 for (0..4) |k| {
-                    sum += self.data[i * 4 + k] * other.data[k * 4 + j];
+                    // Column-major access: data[col*4 + row]
+                    sum += self.data[k * 4 + row] * other.data[col * 4 + k];
                 }
-                result.data[i * 4 + j] = sum;
+                result.data[col * 4 + row] = sum;
             }
         }
         return result;

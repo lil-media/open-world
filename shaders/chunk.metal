@@ -35,19 +35,16 @@ struct Uniforms {
 // Vertex shader
 vertex VertexOut vertex_main(
     VertexIn in [[stage_in]],
-    constant Uniforms& uniforms [[buffer(1)]]
+    constant Uniforms& uniforms [[buffer(1)]],
+    uint vertexID [[vertex_id]]
 ) {
     VertexOut out;
 
-    // Transform position
+    // Transform vertex using MVP matrix
     float4 worldPos = uniforms.model * float4(in.position, 1.0);
     out.position = uniforms.modelViewProjection * float4(in.position, 1.0);
     out.worldPos = worldPos.xyz;
-
-    // Transform normal (use inverse transpose for non-uniform scaling)
-    out.worldNormal = normalize((uniforms.model * float4(in.normal, 0.0)).xyz);
-
-    // Pass through texture coordinates and color
+    out.worldNormal = (uniforms.model * float4(in.normal, 0.0)).xyz;
     out.texCoord = in.texCoord;
     out.color = in.color;
 
@@ -62,20 +59,20 @@ fragment float4 fragment_main(
     constant Uniforms& uniforms [[buffer(0)]]
 ) {
     float4 tex_color = atlas.sample(atlas_sampler, in.texCoord);
-
+    
     float3 normal = normalize(in.worldNormal);
     float3 sunDir = normalize(uniforms.sunDirection.xyz);
     float sun_ndotl = max(dot(normal, sunDir), 0.0);
-
+    
     float3 baseColor = tex_color.rgb * in.color.rgb;
     float3 sunColor = uniforms.sunColor.rgb * sun_ndotl;
     float3 ambient = uniforms.ambientColor.rgb;
     float3 litColor = baseColor * (ambient + sunColor);
-
+    
     float distanceToCamera = length(uniforms.cameraPosition.xyz - in.worldPos);
     float fogFactor = clamp((distanceToCamera - uniforms.fogParams.y) / uniforms.fogParams.z, 0.0, 1.0);
     float3 finalColor = mix(litColor, uniforms.skyColor.rgb, fogFactor);
-
+    
     return float4(finalColor, tex_color.a * in.color.a);
 }
 

@@ -87,7 +87,7 @@ fn updateGpuMeshes(
         const key = entry.key_ptr.*;
         const chunk_ptr = entry.value_ptr.*;
 
-        // Frustum culling: Create AABB for chunk
+        // Frustum culling to avoid rendering off-screen chunks
         const chunk_size_f32 = @as(f32, @floatFromInt(terrain.Chunk.CHUNK_SIZE));
         const chunk_x = @as(f32, @floatFromInt(chunk_ptr.x)) * chunk_size_f32;
         const chunk_z = @as(f32, @floatFromInt(chunk_ptr.z)) * chunk_size_f32;
@@ -95,9 +95,6 @@ fn updateGpuMeshes(
             math.Vec3.init(chunk_x, 0, chunk_z),
             math.Vec3.init(chunk_x + chunk_size_f32, @as(f32, @floatFromInt(terrain.Chunk.CHUNK_HEIGHT)), chunk_z + chunk_size_f32),
         );
-
-        // Skip chunks outside frustum
-        // Note: Add small margin to avoid false culling due to floating point precision
         const margin = 2.0;
         const expanded_aabb = math.AABB.init(
             chunk_aabb.min.sub(math.Vec3.init(margin, margin, margin)),
@@ -422,12 +419,18 @@ pub fn runInteractiveDemo(allocator: std.mem.Allocator, options: DemoOptions) !v
     var chunk_manager = try streaming.ChunkStreamingManager.init(allocator, world_seed, view_distance);
     defer chunk_manager.deinit();
 
-    const spawn_pos = math.Vec3.init(8.0, 80.0, 8.0);
+    // Spawn at reasonable height above terrain
+    const spawn_pos = math.Vec3.init(8.0, 75.0, 8.0); // Slightly above terrain
     var player_physics = player.PlayerPhysics.init(spawn_pos);
     player_physics.is_flying = true;
 
     var main_camera = camera.Camera.init(player_physics.getEyePosition(), 16.0 / 9.0);
     main_camera.setMode(.free_cam);
+
+    // Look down more steeply to see terrain below
+    main_camera.pitch = -0.6; // Look down about 34 degrees
+    main_camera.updateVectors();
+
 
     var last_time: i128 = std.time.nanoTimestamp();
     var accumulator: f64 = 0;
@@ -600,6 +603,7 @@ pub fn runInteractiveDemo(allocator: std.mem.Allocator, options: DemoOptions) !v
             const vp = projection.multiply(view);
             const mvp = vp.multiply(model_matrix);
 
+
             var uniforms = metal_renderer.Uniforms{
                 .model_view_projection = mvp.data,
                 .model = model_matrix.data,
@@ -616,6 +620,9 @@ pub fn runInteractiveDemo(allocator: std.mem.Allocator, options: DemoOptions) !v
             try metal_ctx.setUniforms(std.mem.asBytes(&uniforms));
             try metal_ctx.draw(.{ sky_color_vec.x, sky_color_vec.y, sky_color_vec.z, 1.0 });
         } else {
+            if (total_frames < 15) {
+                std.debug.print("DEBUG: NO MESH - rendering sky only\n", .{});
+            }
             _ = metal_ctx.renderFrame(sky_color_vec.x, sky_color_vec.y, sky_color_vec.z);
         }
 
