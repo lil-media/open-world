@@ -35,12 +35,13 @@ A high-performance voxel-based open world building game optimized for macOS and 
 - [x] Metal Performance HUD integration (enable via `MTL_HUD_ENABLED=1` before launch)
 - [x] Fix segfault during async chunk cleanup (race condition resolved)
 - [x] Debug visualization modes (F4 to cycle: Normal/Wireframe)
+- [x] Cursor lock/unlock (ESC to toggle, ESC again to quit)
+- [x] Incremental mesh generation (3 chunks/frame, eliminates startup stutter)
 
 ### 🏗️ In Progress
 - [ ] Performance profiling and optimization
 
 ### 📋 Next Up
-- [ ] Async mesh generation to eliminate startup stutter (move greedy meshing to background)
 - [ ] Multi-block selection and copy/paste tools
 - [ ] Save/Load system for world persistence
 - [ ] Environmental simulation design pass (weather, fluids, temperature)
