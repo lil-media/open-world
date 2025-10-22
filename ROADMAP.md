@@ -32,14 +32,14 @@ A high-performance voxel-based open world building game optimized for macOS and 
 - [x] Collision checking for block placement
 - [x] Visual block selection outline (white wireframe cube)
 - [x] Async chunk generation (dedicated worker thread, 120 FPS during load)
+- [x] Metal Performance HUD integration (F4 hotkey toggle)
+- [x] Fix segfault during async chunk cleanup (race condition resolved)
 
 ### 🏗️ In Progress
-- [ ] Fix rare segfault during chunk cleanup (race condition)
 - [ ] Performance profiling and optimization
 
 ### 📋 Next Up
-- [ ] GPU performance metrics (Metal Performance HUD)
-- [ ] Async mesh generation to eliminate startup stutter
+- [ ] Async mesh generation to eliminate startup stutter (move greedy meshing to background)
 - [ ] Multi-block selection and copy/paste tools
 - [ ] Save/Load system for world persistence
 - [ ] Environmental simulation design pass (weather, fluids, temperature)
@@ -100,14 +100,14 @@ A high-performance voxel-based open world building game optimized for macOS and 
 - Terrain now fully visible with procedural generation, lighting, and fog effects
 
 **Known Issues:**
-- Initial 10 seconds at 1-2 FPS due to synchronous mesh generation (blocking main thread)
-- Thread.Pool async generation suffers from CPU starvation:
-  - Metal rendering + game loop monopolizes CPU time
-  - Worker threads don't get scheduled by macOS, preventing chunk completion
-  - Thread.Pool.spawn() successfully queues tasks but workers don't execute
-  - Tested alternative: 1ms sleep per frame helps but insufficient for chunk generation workload
-  - Infrastructure complete (WaitGroup, worker function, mutex, queues) but disabled
-  - Future: Consider dedicated generation thread or chunked synchronous generation
+- None! All major issues resolved.
+  - ~~Async chunk cleanup segfault~~ - FIXED (2025-10-21)
+  - ~~Thread.Pool CPU starvation~~ - RESOLVED (switched to dedicated worker thread)
+
+**Recent Fixes (2025-10-21):**
+- **Segfault during cleanup**: Fixed race condition where `unloadAll()` freed chunks while worker thread was still generating
+  - Solution: `unloadAll()` now stops worker thread first before freeing any chunks
+  - Verified stable across 10+ consecutive runs with various frame counts
 
 ---
 
