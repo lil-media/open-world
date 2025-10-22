@@ -11,6 +11,7 @@ pub const SDLWindow = struct {
     should_close: bool,
     width: u32,
     height: u32,
+    cursor_locked: bool,
 
     pub fn init(width: u32, height: u32, title: [*:0]const u8) !SDLWindow {
         if (c.SDL_Init(c.SDL_INIT_VIDEO) < 0) {
@@ -35,12 +36,16 @@ pub const SDLWindow = struct {
             return error.MetalViewCreationFailed;
         };
 
+        // Start with cursor locked for FPS controls
+        _ = c.SDL_SetRelativeMouseMode(c.SDL_TRUE);
+
         return SDLWindow{
             .window = window,
             .metal_view = metal_view,
             .should_close = false,
             .width = width,
             .height = height,
+            .cursor_locked = true,
         };
     }
 
@@ -107,5 +112,15 @@ pub const SDLWindow = struct {
                 else => {},
             }
         }
+    }
+
+    pub fn setCursorLocked(self: *SDLWindow, locked: bool) void {
+        self.cursor_locked = locked;
+        _ = c.SDL_SetRelativeMouseMode(if (locked) c.SDL_TRUE else c.SDL_FALSE);
+        _ = c.SDL_ShowCursor(if (locked) c.SDL_DISABLE else c.SDL_ENABLE);
+    }
+
+    pub fn toggleCursorLock(self: *SDLWindow) void {
+        self.setCursorLocked(!self.cursor_locked);
     }
 };

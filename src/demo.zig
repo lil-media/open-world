@@ -564,7 +564,8 @@ pub fn runInteractiveDemo(allocator: std.mem.Allocator, options: DemoOptions) !v
     std.debug.print("Controls:\n", .{});
     std.debug.print("  Movement: WASD, Space/Ctrl (fly up/down), Shift (sprint), F (toggle fly)\n", .{});
     std.debug.print("  Blocks: Left Click (break), Right Click (place)\n", .{});
-    std.debug.print("  ESC to quit\n", .{});
+    std.debug.print("  Debug: F4 (toggle wireframe)\n", .{});
+    std.debug.print("  ESC (unlock cursor), ESC again (quit)\n", .{});
 
     try chunk_manager.update(player_physics.position, main_camera.front);
 
@@ -607,7 +608,12 @@ pub fn runInteractiveDemo(allocator: std.mem.Allocator, options: DemoOptions) !v
         window.pollEvents(&input_state);
 
         if (input_state.wasKeyPressed(.escape)) {
-            window.should_close = true;
+            if (window.cursor_locked) {
+                window.toggleCursorLock();
+                std.debug.print("Cursor unlocked (Press ESC again to quit)\n", .{});
+            } else {
+                window.should_close = true;
+            }
         }
 
         if (input_state.wasKeyPressed(.f)) {
