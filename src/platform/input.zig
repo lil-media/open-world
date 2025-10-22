@@ -16,6 +16,7 @@ pub const Key = enum(u16) {
     e = 8,
     r = 21,
     f = 9,
+    f4 = 61,
     shift_left = 225,
     ctrl_left = 224,
     alt_left = 226,

@@ -522,6 +522,7 @@ pub fn runInteractiveDemo(allocator: std.mem.Allocator, options: DemoOptions) !v
     std.debug.print("✓ Metal device: {s}\n", .{metal_ctx.getDeviceName()});
 
     var input_state = input.InputState{};
+    var show_performance_hud = false;
 
     const world_seed: u64 = 42;
     const view_distance: i32 = 8;
@@ -603,6 +604,12 @@ pub fn runInteractiveDemo(allocator: std.mem.Allocator, options: DemoOptions) !v
 
         if (input_state.wasKeyPressed(.f)) {
             player_physics.toggleFlying();
+        }
+
+        if (input_state.wasKeyPressed(.f4)) {
+            show_performance_hud = !show_performance_hud;
+            metal_ctx.setPerformanceHUD(show_performance_hud);
+            std.debug.print("Metal Performance HUD: {s}\n", .{if (show_performance_hud) "ON" else "OFF"});
         }
 
         player_physics.setSprinting(input_state.isKeyDown(.shift_left));

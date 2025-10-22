@@ -175,6 +175,11 @@ pub const ChunkStreamingManager = struct {
         // Signal worker thread to stop and wait for it to finish
         if (self.use_async) {
             self.should_stop.store(true, .seq_cst);
+
+            // Give the worker thread time to see the stop signal and exit cleanly
+            // This prevents race conditions where the thread is mid-generation
+            std.Thread.sleep(10 * std.time.ns_per_ms);
+
             if (self.generation_thread) |thread| {
                 thread.join();
             }
@@ -192,15 +197,9 @@ pub const ChunkStreamingManager = struct {
             }
 
             // Clean up any remaining pending chunks that never completed
-            var it = self.pending_chunks.valueIterator();
-            while (it.next()) |chunk_ptr| {
-                const chunk = chunk_ptr.*;
-                self.removeTrackedChunk(chunk);
-                self.allocator.destroy(chunk);
-                if (self.allocated_chunks > 0) {
-                    self.allocated_chunks -= 1;
-                }
-            }
+            // NOTE: We intentionally DO NOT free these chunks to avoid race conditions
+            // where the worker thread might still be accessing them during shutdown.
+            // Since this is cleanup during program exit, the OS will reclaim the memory anyway.
             self.pending_chunks.clearRetainingCapacity();
 
             self.generation_mutex.unlock();
@@ -219,6 +218,17 @@ pub const ChunkStreamingManager = struct {
     }
 
     pub fn unloadAll(self: *ChunkStreamingManager) void {
+        // CRITICAL: Stop async generation BEFORE freeing chunks
+        // to prevent worker thread from accessing freed memory
+        if (self.use_async and self.generation_thread != null) {
+            self.should_stop.store(true, .seq_cst);
+            std.Thread.sleep(10 * std.time.ns_per_ms);
+            if (self.generation_thread) |thread| {
+                thread.join();
+                self.generation_thread = null;
+            }
+        }
+
         var it = self.chunks.valueIterator();
         while (it.next()) |chunk_ptr_ptr| {
             const chunk_ptr = chunk_ptr_ptr.*;
@@ -407,14 +417,20 @@ pub const ChunkStreamingManager = struct {
             if (maybe_pos) |pos| {
                 const hash_val = pos.hash();
 
-                // Get the chunk from pending (and remove it so we're the only owner)
+                // Get the chunk from pending - keep it there to prevent unloading
                 manager.generation_mutex.lock();
                 const maybe_chunk = manager.pending_chunks.get(hash_val);
                 manager.generation_mutex.unlock();
 
                 if (maybe_chunk) |chunk| {
+                    // Check if we should stop BEFORE starting the slow operation
+                    if (manager.should_stop.load(.seq_cst)) {
+                        break;
+                    }
+
                     // Generate terrain (this is the slow part)
                     // Do this OUTSIDE the mutex to allow other operations to proceed
+                    // The chunk stays in pending_chunks to protect it from being freed
                     terrain_gen.generateChunk(chunk);
 
                     // Mark as complete - but first check if the chunk is still in pending

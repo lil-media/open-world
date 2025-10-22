@@ -27,6 +27,7 @@ extern fn metal_set_uniforms(ctx: *anyopaque, uniforms: *const anyopaque, size: 
 extern fn metal_draw(ctx: *anyopaque, clear_color: *const f32) bool;
 extern fn metal_set_line_mesh(ctx: *anyopaque, vertices: *const anyopaque, vertex_count: usize, vertex_stride: usize) bool;
 extern fn metal_set_texture(ctx: *anyopaque, data: [*]const u8, width: usize, height: usize, bytes_per_row: usize) bool;
+extern fn metal_set_performance_hud(ctx: *anyopaque, enabled: bool) void;
 
 pub const MetalContext = struct {
     ctx: *anyopaque,
@@ -131,5 +132,9 @@ pub const MetalContext = struct {
         if (!metal_set_texture(self.ctx, data.ptr, width, height, bytes_per_row)) {
             return error.TextureUploadFailed;
         }
+    }
+
+    pub fn setPerformanceHUD(self: *MetalContext, enabled: bool) void {
+        metal_set_performance_hud(self.ctx, enabled);
     }
 };

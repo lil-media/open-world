@@ -367,6 +367,18 @@ const char* metal_get_device_name(MetalContext* ctx) {
     return [[device name] UTF8String];
 }
 
+void metal_set_performance_hud(MetalContext* ctx, bool enabled) {
+    if (!ctx || !ctx->layer) return;
+
+    // Enable Metal Performance HUD via environment variable
+    // This shows GPU performance metrics as an overlay
+    if (enabled) {
+        setenv("MTL_HUD_ENABLED", "1", 1);
+    } else {
+        unsetenv("MTL_HUD_ENABLED");
+    }
+}
+
 bool metal_set_line_mesh(MetalContext* ctx, const void* vertices, size_t vertex_count, size_t vertex_stride) {
     if (!ctx || !vertices || vertex_count == 0) {
         // Clear line buffer if no vertices
