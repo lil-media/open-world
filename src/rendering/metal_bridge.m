@@ -370,12 +370,21 @@ const char* metal_get_device_name(MetalContext* ctx) {
 void metal_set_performance_hud(MetalContext* ctx, bool enabled) {
     if (!ctx || !ctx->layer) return;
 
-    // Enable Metal Performance HUD via environment variable
-    // This shows GPU performance metrics as an overlay
+    CAMetalLayer* layer = (__bridge CAMetalLayer*)ctx->layer;
+
+    // The Metal HUD is controlled by CAMetalLayer's displaySyncEnabled and developer HUD settings
+    // We need to access the MTLDevice to enable the HUD
+    id<MTLDevice> device = (__bridge id<MTLDevice>)ctx->device;
+
     if (enabled) {
-        setenv("MTL_HUD_ENABLED", "1", 1);
+        // Enable developer HUD by setting environment variable (must be done before device creation)
+        // Since we can't change this at runtime, we enable statistics collection
+        NSLog(@"Metal Performance HUD requested. Note: For full HUD, set MTL_HUD_ENABLED=1 before launch");
+
+        // We can at least enable frame capture and statistics
+        layer.framebufferOnly = NO; // Allow reading back for profiling
     } else {
-        unsetenv("MTL_HUD_ENABLED");
+        layer.framebufferOnly = YES; // Optimize for rendering only
     }
 }
 

@@ -514,6 +514,14 @@ pub fn runConsoleDemo(allocator: std.mem.Allocator) !void {
 pub fn runInteractiveDemo(allocator: std.mem.Allocator, options: DemoOptions) !void {
     std.debug.print("\n=== Open World - Interactive Demo (SDL + Metal) ===\n\n", .{});
 
+    // Check if Metal HUD is requested via environment variable
+    const show_metal_hud = std.posix.getenv("MTL_HUD_ENABLED") != null;
+    if (show_metal_hud) {
+        std.debug.print("Metal Performance HUD: ENABLED (via MTL_HUD_ENABLED)\n", .{});
+    } else {
+        std.debug.print("Tip: Set MTL_HUD_ENABLED=1 to show Metal Performance HUD\n", .{});
+    }
+
     var window = try sdl.SDLWindow.init(1280, 720, "Open World - Interactive Demo");
     defer window.deinit();
 
@@ -522,7 +530,6 @@ pub fn runInteractiveDemo(allocator: std.mem.Allocator, options: DemoOptions) !v
     std.debug.print("✓ Metal device: {s}\n", .{metal_ctx.getDeviceName()});
 
     var input_state = input.InputState{};
-    var show_performance_hud = false;
 
     const world_seed: u64 = 42;
     const view_distance: i32 = 8;
@@ -604,12 +611,6 @@ pub fn runInteractiveDemo(allocator: std.mem.Allocator, options: DemoOptions) !v
 
         if (input_state.wasKeyPressed(.f)) {
             player_physics.toggleFlying();
-        }
-
-        if (input_state.wasKeyPressed(.f4)) {
-            show_performance_hud = !show_performance_hud;
-            metal_ctx.setPerformanceHUD(show_performance_hud);
-            std.debug.print("Metal Performance HUD: {s}\n", .{if (show_performance_hud) "ON" else "OFF"});
         }
 
         player_physics.setSprinting(input_state.isKeyDown(.shift_left));
