@@ -28,6 +28,26 @@ extern fn metal_draw(ctx: *anyopaque, clear_color: *const f32) bool;
 extern fn metal_set_line_mesh(ctx: *anyopaque, vertices: *const anyopaque, vertex_count: usize, vertex_stride: usize) bool;
 extern fn metal_set_texture(ctx: *anyopaque, data: [*]const u8, width: usize, height: usize, bytes_per_row: usize) bool;
 extern fn metal_set_performance_hud(ctx: *anyopaque, enabled: bool) void;
+extern fn metal_set_render_mode(ctx: *anyopaque, mode: i32) void;
+
+pub const RenderMode = enum(i32) {
+    normal = 0,
+    wireframe = 1,
+
+    pub fn next(self: RenderMode) RenderMode {
+        return switch (self) {
+            .normal => .wireframe,
+            .wireframe => .normal,
+        };
+    }
+
+    pub fn name(self: RenderMode) []const u8 {
+        return switch (self) {
+            .normal => "Normal",
+            .wireframe => "Wireframe",
+        };
+    }
+};
 
 pub const MetalContext = struct {
     ctx: *anyopaque,
@@ -136,5 +156,9 @@ pub const MetalContext = struct {
 
     pub fn setPerformanceHUD(self: *MetalContext, enabled: bool) void {
         metal_set_performance_hud(self.ctx, enabled);
+    }
+
+    pub fn setRenderMode(self: *MetalContext, mode: RenderMode) void {
+        metal_set_render_mode(self.ctx, @intFromEnum(mode));
     }
 };

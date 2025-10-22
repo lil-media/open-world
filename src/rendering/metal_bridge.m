@@ -7,6 +7,11 @@
 #import <stdint.h>
 
 // Simple C API for Metal rendering from Zig
+typedef enum {
+    RenderModeNormal = 0,
+    RenderModeWireframe = 1,
+} RenderMode;
+
 typedef struct {
     void* device;
     void* queue;
@@ -24,6 +29,7 @@ typedef struct {
     size_t index_count;
     size_t uniform_size;
     size_t line_vertex_count;
+    RenderMode render_mode;
 } MetalContext;
 
 MetalContext* metal_create_context(void* sdl_metal_view) {
@@ -72,6 +78,7 @@ MetalContext* metal_create_context(void* sdl_metal_view) {
     ctx->index_count = 0;
     ctx->uniform_size = 0;
     ctx->line_vertex_count = 0;
+    ctx->render_mode = RenderModeNormal;
 
     return ctx;
 }
@@ -302,6 +309,14 @@ bool metal_draw(MetalContext* ctx, const float* clear_color) {
 
         [encoder setFrontFacingWinding:MTLWindingCounterClockwise];
         [encoder setCullMode:MTLCullModeNone]; // DEBUG: Disable backface culling
+
+        // Set triangle fill mode based on render mode
+        if (ctx->render_mode == RenderModeWireframe) {
+            [encoder setTriangleFillMode:MTLTriangleFillModeLines];
+        } else {
+            [encoder setTriangleFillMode:MTLTriangleFillModeFill];
+        }
+
         [encoder setVertexBuffer:vertexBuffer offset:0 atIndex:0];
         if (uniformBuffer) {
             [encoder setVertexBuffer:uniformBuffer offset:0 atIndex:1];
@@ -386,6 +401,11 @@ void metal_set_performance_hud(MetalContext* ctx, bool enabled) {
     } else {
         layer.framebufferOnly = YES; // Optimize for rendering only
     }
+}
+
+void metal_set_render_mode(MetalContext* ctx, int mode) {
+    if (!ctx) return;
+    ctx->render_mode = (RenderMode)mode;
 }
 
 bool metal_set_line_mesh(MetalContext* ctx, const void* vertices, size_t vertex_count, size_t vertex_stride) {
