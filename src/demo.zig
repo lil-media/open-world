@@ -186,6 +186,10 @@ fn updateGpuMeshes(
     };
     const atlas_tile_size = 1.0 / @as(f32, @floatFromInt(textures.tiles_per_row));
 
+    // Limit mesh generation per frame to avoid stuttering
+    const max_meshes_per_frame: usize = 3;
+    var meshes_generated_this_frame: usize = 0;
+
     var cache_it = mesh_cache.iterator();
     while (cache_it.next()) |entry| {
         entry.value_ptr.in_use = false;
@@ -231,12 +235,21 @@ fn updateGpuMeshes(
         var cache_entry = cache_entry_ptr.*;
 
         if (chunk_ptr.modified or cache_entry.vertices.len == 0) {
+            // Skip mesh generation if we've hit the per-frame limit
+            if (meshes_generated_this_frame >= max_meshes_per_frame) {
+                // Keep the chunk in the iteration but don't mesh it this frame
+                cache_entry.in_use = true;
+                cache_entry_ptr.* = cache_entry;
+                continue;
+            }
+
             if (cache_entry.vertices.len > 0) allocator.free(cache_entry.vertices);
             if (cache_entry.indices.len > 0) allocator.free(cache_entry.indices);
             stats.changed = true;
 
             var chunk_mesh = try mesher.generateMesh(chunk_ptr);
             defer chunk_mesh.deinit();
+            meshes_generated_this_frame += 1;
 
             const vertex_count = chunk_mesh.vertices.items.len;
             const index_count = chunk_mesh.indices.items.len;
