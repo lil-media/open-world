@@ -1,7 +1,10 @@
 {
   "permissions": {
     "allow": [
-      "Bash(zig-out/bin/render-demo --max-frames 100)"
+      "Bash(zig-out/bin/render-demo --max-frames 100)",
+      "Bash(zig build:*)",
+      "Bash(./zig-out/bin/render-demo:*)",
+      "Bash(git add:*)"
     ],
     "deny": [],
     "ask": []

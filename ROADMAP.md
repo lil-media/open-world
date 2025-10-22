@@ -88,8 +88,14 @@ A high-performance voxel-based open world building game optimized for macOS and 
   - Bug was treating matrices as row-major, causing incorrect transformations
   - All geometry was being placed outside viewport despite correct world positions
   - Fix enables proper rendering with full lighting and texture support
+- **CRITICAL FIX:** Corrected east/west face vertex generation in mesh.zig
+  - Bug: East/west faces used `height` parameter for both Y and Z expansion, ignoring `width`
+  - This caused rectangular greedy-meshed quads to render as incorrect squares
+  - Symptom: "some blocks will render sides but the block beside it doesn't"
+  - Fix: Changed vertex calculations to use `width` for Z expansion, `height` for Y expansion
+  - Result: All faces now render correctly with proper greedy meshing optimization
 - Frustum culling: 90% chunk reduction (110 → 10 chunks rendered)
-- Triangle count: 77% reduction (1.9M → 444K triangles/frame)  
+- Triangle count: 77% reduction (1.9M → 444K triangles/frame)
 - FPS improvement: +15% (100 → 114 FPS)
 - Terrain now fully visible with procedural generation, lighting, and fog effects
 

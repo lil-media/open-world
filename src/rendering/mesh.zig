@@ -128,15 +128,15 @@ pub const ChunkMesh = struct {
                 [3]f32{ x + width, y + height, z + 1 },
             },
             .west => [4][3]f32{
-                [3]f32{ x, y, z + height },
+                [3]f32{ x, y, z + width },
                 [3]f32{ x, y, z },
                 [3]f32{ x, y + height, z },
-                [3]f32{ x, y + height, z + height },
+                [3]f32{ x, y + height, z + width },
             },
             .east => [4][3]f32{
                 [3]f32{ x + 1, y, z },
-                [3]f32{ x + 1, y, z + height },
-                [3]f32{ x + 1, y + height, z + height },
+                [3]f32{ x + 1, y, z + width },
+                [3]f32{ x + 1, y + height, z + width },
                 [3]f32{ x + 1, y + height, z },
             },
         };
@@ -320,6 +320,7 @@ pub const GreedyMesher = struct {
                         // Determine face direction based on which side we're processing
                         const face_dir = getFaceDirection(axis, is_positive_direction);
                         const face_block_type = block_type;
+
 
                         // Calculate ambient occlusion (simplified - all 1.0 for now)
                         const ao = [4]f32{ 1.0, 1.0, 1.0, 1.0 };
