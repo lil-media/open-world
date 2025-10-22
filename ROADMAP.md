@@ -32,7 +32,7 @@ A high-performance voxel-based open world building game optimized for macOS and 
 - [x] Collision checking for block placement
 - [x] Visual block selection outline (white wireframe cube)
 - [x] Async chunk generation (dedicated worker thread, 120 FPS during load)
-- [x] Metal Performance HUD integration (F4 hotkey toggle)
+- [x] Metal Performance HUD integration (enable via `MTL_HUD_ENABLED=1` before launch)
 - [x] Fix segfault during async chunk cleanup (race condition resolved)
 
 ### 🏗️ In Progress
