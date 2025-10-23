@@ -2,6 +2,7 @@ const std = @import("std");
 const terrain = @import("terrain/terrain.zig");
 const generator = @import("terrain/generator.zig");
 const streaming = @import("terrain/streaming.zig");
+const persistence = @import("terrain/persistence.zig");
 const camera = @import("rendering/camera.zig");
 const mesh = @import("rendering/mesh.zig");
 const player = @import("physics/player.zig");
@@ -13,25 +14,828 @@ const input = @import("platform/input.zig");
 const metal_renderer = @import("rendering/metal_renderer.zig");
 const textures = @import("assets/texture_gen.zig");
 const raycast = @import("utils/raycast.zig");
+const line_text = @import("ui/line_text.zig");
+
+const default_world_name = "default_world";
+const autosave_default_presets = [_]u32{ 0, 15, 30, 60, 120 };
+const backup_default_presets = [_]usize{ 1, 2, 3, 5, 8, 12, 16 };
 
 pub const DemoOptions = struct {
     max_frames: ?u32 = null,
+    world_name: []const u8 = default_world_name,
+    world_seed: ?u64 = null,
+    force_new_world: bool = false,
+    worlds_root: []const u8 = persistence.default_worlds_root,
 };
+
+const WorldSelectionResult = struct {
+    name: []u8,
+    seed: ?u64,
+    force_new: bool,
+};
+
+fn generateRandomSeed() u64 {
+    const ns = std.time.nanoTimestamp();
+    const abs_ns: u128 = if (ns < 0) @intCast(-ns) else @intCast(ns);
+    const base_seed: u64 = @truncate(abs_ns);
+    var prng = std.Random.DefaultPrng.init(base_seed ^ 0x9E3779B97F4A7C15);
+    return prng.random().int(u64);
+}
+
+fn formatTimestamp(buffer: []u8, timestamp: i64) []const u8 {
+    if (timestamp <= 0) return "never";
+    return std.fmt.bufPrint(buffer, "{d}", .{timestamp}) catch "invalid";
+}
+
+fn generateUniqueWorldName(allocator: std.mem.Allocator, worlds_root: []const u8) ![]u8 {
+    var attempt: u32 = 0;
+    while (attempt < 1000) : (attempt += 1) {
+        const timestamp = std.time.timestamp();
+        const name = if (attempt == 0)
+            try std.fmt.allocPrint(allocator, "world-{d}", .{timestamp})
+        else
+            try std.fmt.allocPrint(allocator, "world-{d}-{d}", .{ timestamp, attempt });
+        const exists = try persistence.WorldPersistence.worldExists(allocator, worlds_root, name);
+        if (!exists) {
+            return name;
+        }
+        allocator.free(name);
+    }
+    return error.WorldNameGenerationFailed;
+}
+
+fn deleteWorldDirectory(allocator: std.mem.Allocator, worlds_root: []const u8, world_name: []const u8) !void {
+    const path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ worlds_root, world_name });
+    defer allocator.free(path);
+
+    std.fs.cwd().deleteTree(path) catch |err| {
+        if (err != error.FileNotFound) {
+            std.debug.print("Failed to delete world '{s}': {any}\n", .{ world_name, err });
+        }
+    };
+}
+
+fn sanitizeWorldName(allocator: std.mem.Allocator, name: []const u8) ![]u8 {
+    var cleaned = std.ArrayListUnmanaged(u8){};
+    errdefer cleaned.deinit(allocator);
+
+    for (name) |ch| {
+        if (std.ascii.isAlphanumeric(ch) or ch == '-' or ch == '_') {
+            try cleaned.append(allocator, std.ascii.toUpper(ch));
+        } else if (ch == ' ') {
+            try cleaned.append(allocator, '_');
+        }
+    }
+
+    if (cleaned.items.len == 0) {
+        return error.InvalidWorldName;
+    }
+
+    return cleaned.toOwnedSlice(allocator);
+}
+
+fn promptLine(buffer: []u8) ![]u8 {
+    const stdin_file = std.fs.File.stdin();
+    const read_len = try stdin_file.read(buffer);
+    const slice = buffer[0..read_len];
+
+    var start: usize = 0;
+    while (start < slice.len and isWhitespace(slice[start])) : (start += 1) {}
+
+    var end = slice.len;
+    while (end > start and isWhitespace(slice[end - 1])) : (end -= 1) {}
+
+    return buffer[start..end];
+}
+
+fn isWhitespace(ch: u8) bool {
+    return ch == ' ' or ch == '\t' or ch == '\r' or ch == '\n';
+}
+
+fn renameWorldInteractive(
+    allocator: std.mem.Allocator,
+    worlds_root: []const u8,
+    current_name: []const u8,
+) !bool {
+    std.debug.print("Rename world '{s}' -> ", .{current_name});
+    var input_buf: [256]u8 = undefined;
+    const raw = try promptLine(&input_buf);
+    if (raw.len == 0) return false;
+
+    const sanitized = sanitizeWorldName(allocator, raw) catch |err| {
+        std.debug.print("Invalid name: {any}\n", .{err});
+        return false;
+    };
+    defer allocator.free(sanitized);
+
+    if (std.mem.eql(u8, sanitized, current_name)) {
+        std.debug.print("Name unchanged.\n", .{});
+        return false;
+    }
+
+    const exists = try persistence.WorldPersistence.worldExists(allocator, worlds_root, sanitized);
+    if (exists) {
+        std.debug.print("World '{s}' already exists.\n", .{sanitized});
+        return false;
+    }
+
+    const old_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ worlds_root, current_name });
+    defer allocator.free(old_path);
+    const new_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ worlds_root, sanitized });
+    defer allocator.free(new_path);
+
+    std.fs.cwd().rename(old_path, new_path) catch |err| {
+        std.debug.print("Failed to rename world: {any}\n", .{err});
+        return false;
+    };
+
+    const meta_path = try std.fmt.allocPrint(allocator, "{s}/{s}/world.meta", .{ worlds_root, sanitized });
+    defer allocator.free(meta_path);
+
+    var metadata = try persistence.WorldPersistence.loadMetadata(allocator, worlds_root, sanitized);
+    defer metadata.deinit(allocator);
+
+    allocator.free(metadata.name);
+    metadata.name = try allocator.dupe(u8, sanitized);
+    metadata.last_played_timestamp = std.time.timestamp();
+    try metadata.save(allocator, meta_path);
+
+    std.debug.print("World renamed to '{s}'.\n", .{sanitized});
+    return true;
+}
+
+fn updateWorldSeedInteractive(
+    allocator: std.mem.Allocator,
+    worlds_root: []const u8,
+    world_name: []const u8,
+) !bool {
+    std.debug.print("Enter new seed for '{s}' (blank = random): ", .{world_name});
+    var input_buf: [64]u8 = undefined;
+    const raw = try promptLine(&input_buf);
+
+    var new_seed: u64 = undefined;
+    if (raw.len == 0) {
+        new_seed = generateRandomSeed();
+    } else {
+        new_seed = std.fmt.parseInt(u64, raw, 10) catch |err| {
+            std.debug.print("Invalid seed: {any}\n", .{err});
+            return false;
+        };
+    }
+
+    const meta_path = try std.fmt.allocPrint(allocator, "{s}/{s}/world.meta", .{ worlds_root, world_name });
+    defer allocator.free(meta_path);
+
+    var metadata = try persistence.WorldPersistence.loadMetadata(allocator, worlds_root, world_name);
+    defer metadata.deinit(allocator);
+
+    metadata.seed = new_seed;
+    metadata.last_played_timestamp = std.time.timestamp();
+    try metadata.save(allocator, meta_path);
+
+    std.debug.print("Seed updated for '{s}' -> {d}.\n", .{ world_name, new_seed });
+    return true;
+}
+
+fn showWorldSelectionMenu(
+    allocator: std.mem.Allocator,
+    worlds_root: []const u8,
+    window: *sdl.SDLWindow,
+    metal_ctx: *metal.MetalContext,
+    input_state: *input.InputState,
+) !?WorldSelectionResult {
+    defer {
+        metal_ctx.setLineMesh(&[_]u8{}, @sizeOf(metal_renderer.Vertex)) catch {};
+        metal_ctx.setUIMesh(&[_]u8{}, @sizeOf(line_text.UIVertex)) catch {};
+    }
+
+    var infos = try persistence.WorldPersistence.listWorlds(allocator, worlds_root);
+    defer persistence.WorldPersistence.freeWorldInfoList(allocator, infos);
+
+    if (infos.len == 0) {
+        const name = try generateUniqueWorldName(allocator, worlds_root);
+        const seed = generateRandomSeed();
+        std.debug.print("No existing worlds found. Creating '{s}' (seed {d}).\n", .{ name, seed });
+        return WorldSelectionResult{
+            .name = name,
+            .seed = seed,
+            .force_new = true,
+        };
+    }
+
+    var selection: usize = 0;
+    var confirm_delete: ?usize = null;
+    var status_message: []const u8 = "";
+    var status_timer: f32 = 0;
+    var status_buffer: [128]u8 = undefined;
+    var last_settings_selection: ?usize = null;
+    var selected_settings = persistence.WorldSettingsSummary{
+        .autosave_interval_seconds = persistence.default_autosave_interval_seconds,
+        .backup_retention = persistence.default_region_backup_retention,
+        .last_backup_timestamp = 0,
+    };
+
+    if (window.cursor_locked) {
+        window.setCursorLocked(false);
+    }
+
+    if (selection < infos.len) {
+        selected_settings = persistence.loadWorldSettingsSummary(allocator, worlds_root, infos[selection].name) catch |err| blk: {
+            std.debug.print("Failed to load settings for world '{s}': {any}\n", .{ infos[selection].name, err });
+            break :blk persistence.WorldSettingsSummary{
+                .autosave_interval_seconds = persistence.default_autosave_interval_seconds,
+                .backup_retention = persistence.default_region_backup_retention,
+                .last_backup_timestamp = 0,
+            };
+        };
+        last_settings_selection = selection;
+    }
+
+    const frame_dt: f32 = 1.0 / 60.0;
+
+    while (true) {
+        input_state.beginFrame();
+        window.pollEvents(input_state);
+
+        if (window.should_close) {
+            return null;
+        }
+
+        if (status_timer > 0) {
+            status_timer -= frame_dt;
+            if (status_timer <= 0) {
+                status_timer = 0;
+                status_message = "";
+            }
+        }
+
+        const option_count: usize = infos.len + 1;
+
+        if (input_state.wasKeyPressed(.down)) {
+            selection = (selection + 1) % option_count;
+            confirm_delete = null;
+            last_settings_selection = null;
+        } else if (input_state.wasKeyPressed(.up)) {
+            selection = (selection + option_count - 1) % option_count;
+            confirm_delete = null;
+            last_settings_selection = null;
+        }
+
+        if (input_state.wasKeyPressed(.escape)) {
+            window.should_close = true;
+            return null;
+        }
+
+        if (selection < infos.len) {
+            if (last_settings_selection == null or last_settings_selection.? != selection) {
+                selected_settings = persistence.loadWorldSettingsSummary(allocator, worlds_root, infos[selection].name) catch |err| blk: {
+                    std.debug.print("Failed to load settings for world '{s}': {any}\n", .{ infos[selection].name, err });
+                    break :blk persistence.WorldSettingsSummary{
+                        .autosave_interval_seconds = persistence.default_autosave_interval_seconds,
+                        .backup_retention = persistence.default_region_backup_retention,
+                        .last_backup_timestamp = 0,
+                    };
+                };
+                last_settings_selection = selection;
+            }
+        } else {
+            last_settings_selection = null;
+        }
+
+        if (selection < infos.len and input_state.wasKeyPressed(.r)) {
+            if (try renameWorldInteractive(allocator, worlds_root, infos[selection].name)) {
+                persistence.WorldPersistence.freeWorldInfoList(allocator, infos);
+                infos = try persistence.WorldPersistence.listWorlds(allocator, worlds_root);
+                if (selection >= infos.len) selection = infos.len - 1;
+                last_settings_selection = null;
+                status_message = "RENAMED WORLD";
+                status_timer = 3.0;
+            } else {
+                status_message = "RENAME FAILED";
+                status_timer = 3.0;
+            }
+            confirm_delete = null;
+            continue;
+        }
+
+        if (selection < infos.len and input_state.wasKeyPressed(.s)) {
+            if (try updateWorldSeedInteractive(allocator, worlds_root, infos[selection].name)) {
+                persistence.WorldPersistence.freeWorldInfoList(allocator, infos);
+                infos = try persistence.WorldPersistence.listWorlds(allocator, worlds_root);
+                last_settings_selection = null;
+                status_message = "SEED UPDATED";
+                status_timer = 3.0;
+            } else {
+                status_message = "SEED UPDATE FAILED";
+                status_timer = 3.0;
+            }
+            confirm_delete = null;
+            continue;
+        }
+
+        const delete_pressed = input_state.wasKeyPressed(.delete) or input_state.wasKeyPressed(.backspace);
+        if (selection < infos.len and (delete_pressed or input_state.wasKeyPressed(.x))) {
+            if (confirm_delete) |idx_confirm| {
+                if (idx_confirm == selection) {
+                    const target = infos[selection].name;
+                    deleteWorldDirectory(allocator, worlds_root, target) catch |err| {
+                        std.debug.print("Failed to delete world '{s}': {any}\n", .{ target, err });
+                        status_message = "DELETE FAILED";
+                        status_timer = 3.0;
+                        confirm_delete = null;
+                        continue;
+                    };
+                    persistence.WorldPersistence.freeWorldInfoList(allocator, infos);
+                    infos = try persistence.WorldPersistence.listWorlds(allocator, worlds_root);
+                    if (infos.len == 0) {
+                        const name = try generateUniqueWorldName(allocator, worlds_root);
+                        const seed = generateRandomSeed();
+                        std.debug.print("All worlds deleted. Creating '{s}' (seed {d}).\n", .{ name, seed });
+                        return WorldSelectionResult{
+                            .name = name,
+                            .seed = seed,
+                            .force_new = true,
+                        };
+                    }
+                    if (selection >= infos.len) selection = infos.len - 1;
+                    last_settings_selection = null;
+                    status_message = "WORLD DELETED";
+                    status_timer = 3.0;
+                    confirm_delete = null;
+                } else {
+                    confirm_delete = selection;
+                    status_message = "PRESS DELETE AGAIN TO CONFIRM";
+                    status_timer = 3.0;
+                }
+            } else {
+                confirm_delete = selection;
+                status_message = "PRESS DELETE AGAIN TO CONFIRM";
+                status_timer = 3.0;
+            }
+            continue;
+        }
+
+        if (selection < infos.len) {
+            const world_name = infos[selection].name;
+
+            if (input_state.wasKeyPressed(.f5)) {
+                const current_interval = selected_settings.autosave_interval_seconds;
+                var candidates: [autosave_default_presets.len + 1]u32 = undefined;
+                var cand_len: usize = 0;
+                inline for (autosave_default_presets) |preset| {
+                    candidates[cand_len] = preset;
+                    cand_len += 1;
+                }
+                var has_current = false;
+                var ci: usize = 0;
+                while (ci < cand_len) : (ci += 1) {
+                    if (candidates[ci] == current_interval) {
+                        has_current = true;
+                        break;
+                    }
+                }
+                if (!has_current) {
+                    candidates[cand_len] = current_interval;
+                    cand_len += 1;
+                }
+                std.sort.heap(u32, candidates[0..cand_len], {}, struct {
+                    fn lessThan(_: void, lhs: u32, rhs: u32) bool {
+                        return lhs < rhs;
+                    }
+                }.lessThan);
+                var unique: [autosave_default_presets.len + 1]u32 = undefined;
+                var unique_len: usize = 0;
+                var have_prev = false;
+                var prev: u32 = 0;
+                var ui: usize = 0;
+                while (ui < cand_len) : (ui += 1) {
+                    const value = candidates[ui];
+                    if (!have_prev or value != prev) {
+                        unique[unique_len] = value;
+                        unique_len += 1;
+                        prev = value;
+                        have_prev = true;
+                    }
+                }
+                if (unique_len > 0) {
+                    var current_idx: usize = 0;
+                    for (unique[0..unique_len], 0..) |value, idx| {
+                        if (value == current_interval) {
+                            current_idx = idx;
+                            break;
+                        }
+                    }
+                    const next_idx = (current_idx + 1) % unique_len;
+                    const new_interval = unique[next_idx];
+                    const autosave_success = blk: {
+                        persistence.setWorldAutosaveInterval(allocator, worlds_root, world_name, new_interval) catch |err| {
+                            std.debug.print("Failed to update autosave interval for '{s}': {any}\n", .{ world_name, err });
+                            status_message = "AUTOSAVE UPDATE FAILED";
+                            status_timer = 3.0;
+                            break :blk false;
+                        };
+                        break :blk true;
+                    };
+                    if (autosave_success) {
+                        selected_settings.autosave_interval_seconds = new_interval;
+                        status_message = if (new_interval == 0)
+                            "AUTOSAVE OFF"
+                        else
+                            std.fmt.bufPrint(&status_buffer, "AUTOSAVE EVERY {d}s", .{new_interval}) catch "AUTOSAVE UPDATED";
+                        status_timer = 3.0;
+                        std.debug.print("World '{s}' autosave interval set to {d} seconds.\n", .{ world_name, new_interval });
+                    }
+                }
+            }
+
+            if (input_state.wasKeyPressed(.f7)) {
+                const current_retention = selected_settings.backup_retention;
+                var candidates: [backup_default_presets.len + 1]usize = undefined;
+                var cand_len: usize = 0;
+                inline for (backup_default_presets) |preset| {
+                    candidates[cand_len] = preset;
+                    cand_len += 1;
+                }
+                var has_current = false;
+                var ri: usize = 0;
+                while (ri < cand_len) : (ri += 1) {
+                    if (candidates[ri] == current_retention) {
+                        has_current = true;
+                        break;
+                    }
+                }
+                if (!has_current) {
+                    candidates[cand_len] = current_retention;
+                    cand_len += 1;
+                }
+                std.sort.heap(usize, candidates[0..cand_len], {}, struct {
+                    fn lessThan(_: void, lhs: usize, rhs: usize) bool {
+                        return lhs < rhs;
+                    }
+                }.lessThan);
+                var unique: [backup_default_presets.len + 1]usize = undefined;
+                var unique_len: usize = 0;
+                var prev: usize = 0;
+                var have_prev = false;
+                var uj: usize = 0;
+                while (uj < cand_len) : (uj += 1) {
+                    const value = candidates[uj];
+                    if (!have_prev or value != prev) {
+                        unique[unique_len] = value;
+                        unique_len += 1;
+                        prev = value;
+                        have_prev = true;
+                    }
+                }
+                if (unique_len > 0) {
+                    var current_idx: usize = 0;
+                    for (unique[0..unique_len], 0..) |value, idx| {
+                        if (value == current_retention) {
+                            current_idx = idx;
+                            break;
+                        }
+                    }
+                    const next_idx = if (current_idx + 1 < unique_len) current_idx + 1 else current_idx;
+                    if (next_idx == current_idx) {
+                        status_message = "BACKUPS MAX";
+                        status_timer = 2.5;
+                    } else {
+                        const new_retention = unique[next_idx];
+                        const backup_success = blk: {
+                            persistence.setWorldBackupRetention(allocator, worlds_root, world_name, new_retention) catch |err| {
+                                std.debug.print("Failed to update backups retention for '{s}': {any}\n", .{ world_name, err });
+                                status_message = "BACKUPS UPDATE FAILED";
+                                status_timer = 3.0;
+                                break :blk false;
+                            };
+                            break :blk true;
+                        };
+                        if (backup_success) {
+                            selected_settings.backup_retention = new_retention;
+                            status_message = std.fmt.bufPrint(&status_buffer, "BACKUPS KEEP {d}", .{new_retention}) catch "BACKUPS UPDATED";
+                            status_timer = 3.0;
+                            std.debug.print("World '{s}' backup retention set to {d}.\n", .{ world_name, new_retention });
+                        }
+                    }
+                }
+            } else if (input_state.wasKeyPressed(.f8)) {
+                const current_retention = selected_settings.backup_retention;
+                var candidates: [backup_default_presets.len + 1]usize = undefined;
+                var cand_len: usize = 0;
+                inline for (backup_default_presets) |preset| {
+                    candidates[cand_len] = preset;
+                    cand_len += 1;
+                }
+                var has_current = false;
+                var ri: usize = 0;
+                while (ri < cand_len) : (ri += 1) {
+                    if (candidates[ri] == current_retention) {
+                        has_current = true;
+                        break;
+                    }
+                }
+                if (!has_current) {
+                    candidates[cand_len] = current_retention;
+                    cand_len += 1;
+                }
+                std.sort.heap(usize, candidates[0..cand_len], {}, struct {
+                    fn lessThan(_: void, lhs: usize, rhs: usize) bool {
+                        return lhs < rhs;
+                    }
+                }.lessThan);
+                var unique: [backup_default_presets.len + 1]usize = undefined;
+                var unique_len: usize = 0;
+                var prev: usize = 0;
+                var have_prev = false;
+                var uj: usize = 0;
+                while (uj < cand_len) : (uj += 1) {
+                    const value = candidates[uj];
+                    if (!have_prev or value != prev) {
+                        unique[unique_len] = value;
+                        unique_len += 1;
+                        prev = value;
+                        have_prev = true;
+                    }
+                }
+                if (unique_len > 0) {
+                    var current_idx: usize = 0;
+                    for (unique[0..unique_len], 0..) |value, idx| {
+                        if (value == current_retention) {
+                            current_idx = idx;
+                            break;
+                        }
+                    }
+                    const next_idx = if (current_idx > 0) current_idx - 1 else current_idx;
+                    if (next_idx == current_idx) {
+                        status_message = "BACKUPS MIN";
+                        status_timer = 2.5;
+                    } else {
+                        const new_retention = unique[next_idx];
+                        const backup_success = blk: {
+                            persistence.setWorldBackupRetention(allocator, worlds_root, world_name, new_retention) catch |err| {
+                                std.debug.print("Failed to update backups retention for '{s}': {any}\n", .{ world_name, err });
+                                status_message = "BACKUPS UPDATE FAILED";
+                                status_timer = 3.0;
+                                break :blk false;
+                            };
+                            break :blk true;
+                        };
+                        if (backup_success) {
+                            selected_settings.backup_retention = new_retention;
+                            status_message = std.fmt.bufPrint(&status_buffer, "BACKUPS KEEP {d}", .{new_retention}) catch "BACKUPS UPDATED";
+                            status_timer = 3.0;
+                            std.debug.print("World '{s}' backup retention set to {d}.\n", .{ world_name, new_retention });
+                        }
+                    }
+                }
+            }
+
+            if (input_state.wasKeyPressed(.f9)) {
+                const reset_success = blk: {
+                    persistence.resetWorldSettings(allocator, worlds_root, world_name) catch |err| {
+                        std.debug.print("Failed to reset settings for '{s}': {any}\n", .{ world_name, err });
+                        status_message = "RESET FAILED";
+                        status_timer = 3.0;
+                        break :blk false;
+                    };
+                    break :blk true;
+                };
+                if (reset_success) {
+                    selected_settings = persistence.loadWorldSettingsSummary(allocator, worlds_root, world_name) catch |err| blk2: {
+                        std.debug.print("Failed to reload settings for '{s}': {any}\n", .{ world_name, err });
+                        break :blk2 persistence.WorldSettingsSummary{
+                            .autosave_interval_seconds = persistence.default_autosave_interval_seconds,
+                            .backup_retention = persistence.default_region_backup_retention,
+                            .last_backup_timestamp = 0,
+                        };
+                    };
+                    status_message = "SETTINGS RESET";
+                    status_timer = 3.0;
+                    std.debug.print("World '{s}' settings reset to defaults.\n", .{world_name});
+                }
+            }
+        }
+
+        if (input_state.wasKeyPressed(.enter)) {
+            if (selection < infos.len) {
+                const info = infos[selection];
+                const name_copy = try allocator.dupe(u8, info.name);
+                window.should_close = false;
+                return WorldSelectionResult{
+                    .name = name_copy,
+                    .seed = info.seed,
+                    .force_new = false,
+                };
+            } else {
+                const name = try generateUniqueWorldName(allocator, worlds_root);
+                const seed = generateRandomSeed();
+                std.debug.print("Creating world '{s}' (seed {d})\n", .{ name, seed });
+                window.should_close = false;
+                return WorldSelectionResult{
+                    .name = name,
+                    .seed = seed,
+                    .force_new = true,
+                };
+            }
+        }
+
+        var overlay_settings: ?persistence.WorldSettingsSummary = null;
+        if (selection < infos.len) {
+            if (last_settings_selection) |idx| {
+                if (idx == selection) {
+                    overlay_settings = selected_settings;
+                }
+            }
+        }
+
+        try renderWorldSelectionOverlay(
+            allocator,
+            metal_ctx,
+            infos,
+            selection,
+            confirm_delete,
+            status_message,
+            overlay_settings,
+            window.width,
+            window.height,
+        );
+
+        std.Thread.sleep(16 * std.time.ns_per_ms);
+    }
+}
+
+fn renderWorldSelectionOverlay(
+    allocator: std.mem.Allocator,
+    metal_ctx: *metal.MetalContext,
+    infos: []persistence.WorldInfo,
+    selection: usize,
+    confirm_delete: ?usize,
+    status_message: []const u8,
+    selected_settings: ?persistence.WorldSettingsSummary,
+    screen_width: u32,
+    screen_height: u32,
+) !void {
+    var builder = std.ArrayListUnmanaged(line_text.UIVertex){};
+    defer builder.deinit(allocator);
+
+    const screen_size = math.Vec2.init(@floatFromInt(screen_width), @floatFromInt(screen_height));
+    const text_scale: f32 = 2.0;
+    const line_height = line_text.lineHeightPx(text_scale);
+    const padding = 18.0;
+    const origin_px = math.Vec2.init(48.0, 80.0);
+
+    var max_width = line_text.textWidth("OPEN WORLD  SELECT SAVE", text_scale);
+    var line_count: usize = 1;
+
+    var buf: [128]u8 = undefined;
+    var timestamp_buf: [48]u8 = undefined;
+    for (infos, 0..) |info, idx| {
+        const entry_text = std.fmt.bufPrint(&buf, "{s} {s} SEED {d}", .{ if (selection == idx) ">" else " ", info.name, info.seed }) catch "ENTRY";
+        max_width = @max(max_width, line_text.textWidth(entry_text, text_scale));
+        line_count += 1;
+        if (selection == idx) {
+            const detail_text = std.fmt.bufPrint(&buf, "LAST {d}", .{info.last_played_timestamp}) catch "DETAIL";
+            max_width = @max(max_width, line_text.textWidth(detail_text, text_scale));
+            line_count += 1;
+
+            if (selected_settings) |settings| {
+                const autosave_text = if (settings.autosave_interval_seconds == 0)
+                    "AUTOSAVE: OFF"
+                else
+                    std.fmt.bufPrint(&buf, "AUTOSAVE: {d}s", .{settings.autosave_interval_seconds}) catch "AUTOSAVE";
+                max_width = @max(max_width, line_text.textWidth(autosave_text, text_scale));
+                line_count += 1;
+
+                const retention_text = std.fmt.bufPrint(&buf, "BACKUPS: KEEP {d}", .{settings.backup_retention}) catch "BACKUPS";
+                max_width = @max(max_width, line_text.textWidth(retention_text, text_scale));
+                line_count += 1;
+
+                const ts_str = formatTimestamp(&timestamp_buf, settings.last_backup_timestamp);
+                const backup_last_text = std.fmt.bufPrint(&buf, "BACKUP: LAST {s}", .{ts_str}) catch "BACKUP LAST";
+                max_width = @max(max_width, line_text.textWidth(backup_last_text, text_scale));
+                line_count += 1;
+            }
+
+            if (confirm_delete) |idx_confirm| {
+                if (idx_confirm == idx) {
+                    max_width = @max(max_width, line_text.textWidth("CONFIRM DELETE", text_scale));
+                    line_count += 1;
+                }
+            }
+        }
+    }
+
+    max_width = @max(max_width, line_text.textWidth("CREATE NEW WORLD", text_scale));
+    line_count += 1;
+
+    if (status_message.len > 0) {
+        max_width = @max(max_width, line_text.textWidth(status_message, text_scale));
+        line_count += 1;
+    }
+
+    const instructions_primary = "ENTER PLAY  R RENAME  S SEED  DEL/BKSP DELETE  ESC QUIT";
+    const instructions_secondary = "F5 CYCLE AUTOSAVE  F7/F8 BACKUPS  F9 RESET";
+    max_width = @max(max_width, line_text.textWidth(instructions_primary, text_scale));
+    line_count += 1;
+    max_width = @max(max_width, line_text.textWidth(instructions_secondary, text_scale));
+    line_count += 1;
+
+    const panel_width = max_width + padding * 2.0;
+    const panel_height = @as(f32, @floatFromInt(line_count)) * line_height + padding * 2.0;
+
+    try line_text.appendQuad(
+        &builder,
+        allocator,
+        origin_px,
+        origin_px.add(math.Vec2.init(panel_width, panel_height)),
+        screen_size,
+        [4]f32{ 0.05, 0.07, 0.12, 0.88 },
+    );
+
+    var cursor = origin_px.add(math.Vec2.init(padding, padding));
+    try line_text.appendText(&builder, allocator, "OPEN WORLD  SELECT SAVE", cursor, text_scale, screen_size, [4]f32{ 0.9, 0.95, 1.0, 1.0 });
+    cursor.y += line_height;
+
+    for (infos, 0..) |info, idx| {
+        const entry_text = std.fmt.bufPrint(&buf, "{s} {s} SEED {d}", .{ if (selection == idx) ">" else " ", info.name, info.seed }) catch "ENTRY";
+        try line_text.appendText(&builder, allocator, entry_text, cursor, text_scale, screen_size, if (selection == idx) [4]f32{ 1.0, 0.9, 0.3, 1.0 } else [4]f32{ 0.78, 0.82, 0.9, 1.0 });
+        cursor.y += line_height;
+
+        if (selection == idx) {
+            const detail_text = std.fmt.bufPrint(&buf, "LAST {d}", .{info.last_played_timestamp}) catch "DETAIL";
+            try line_text.appendText(&builder, allocator, detail_text, cursor, text_scale, screen_size, [4]f32{ 0.75, 0.88, 0.95, 1.0 });
+            cursor.y += line_height;
+
+            if (selected_settings) |settings| {
+                const autosave_line = if (settings.autosave_interval_seconds == 0)
+                    "AUTOSAVE: OFF"
+                else
+                    std.fmt.bufPrint(&buf, "AUTOSAVE: {d}s", .{settings.autosave_interval_seconds}) catch "AUTOSAVE";
+                try line_text.appendText(&builder, allocator, autosave_line, cursor, text_scale, screen_size, [4]f32{ 0.72, 0.9, 1.0, 1.0 });
+                cursor.y += line_height;
+
+                const retention_line = std.fmt.bufPrint(&buf, "BACKUPS: KEEP {d}", .{settings.backup_retention}) catch "BACKUPS";
+                try line_text.appendText(&builder, allocator, retention_line, cursor, text_scale, screen_size, [4]f32{ 0.68, 0.92, 0.78, 1.0 });
+                cursor.y += line_height;
+
+                const ts_str = formatTimestamp(&timestamp_buf, settings.last_backup_timestamp);
+                const last_backup_line = std.fmt.bufPrint(&buf, "BACKUP: LAST {s}", .{ts_str}) catch "BACKUP LAST";
+                try line_text.appendText(&builder, allocator, last_backup_line, cursor, text_scale, screen_size, [4]f32{ 0.8, 0.85, 1.0, 1.0 });
+                cursor.y += line_height;
+            }
+
+            if (confirm_delete) |idx_confirm| {
+                if (idx_confirm == idx) {
+                    try line_text.appendText(&builder, allocator, "CONFIRM DELETE", cursor, text_scale, screen_size, [4]f32{ 1.0, 0.35, 0.35, 1.0 });
+                    cursor.y += line_height;
+                }
+            }
+        }
+    }
+
+    const create_color = if (selection == infos.len) [4]f32{ 0.6, 1.0, 0.7, 1.0 } else [4]f32{ 0.75, 0.82, 0.9, 1.0 };
+    try line_text.appendText(&builder, allocator, "CREATE NEW WORLD", cursor, text_scale, screen_size, create_color);
+    cursor.y += line_height;
+
+    if (status_message.len > 0) {
+        try line_text.appendText(&builder, allocator, status_message, cursor, text_scale, screen_size, [4]f32{ 0.95, 0.85, 0.6, 1.0 });
+        cursor.y += line_height;
+    }
+    try line_text.appendText(&builder, allocator, instructions_primary, cursor, text_scale, screen_size, [4]f32{ 0.7, 0.85, 1.0, 1.0 });
+    cursor.y += line_height;
+    try line_text.appendText(&builder, allocator, instructions_secondary, cursor, text_scale, screen_size, [4]f32{ 0.65, 0.8, 1.0, 1.0 });
+
+    if (builder.items.len == 0) {
+        try metal_ctx.setUIMesh(&[_]u8{}, @sizeOf(line_text.UIVertex));
+    } else {
+        const bytes = std.mem.sliceAsBytes(builder.items);
+        try metal_ctx.setUIMesh(bytes, @sizeOf(line_text.UIVertex));
+    }
+
+    try metal_ctx.draw(.{ 0.05, 0.08, 0.12, 1.0 });
+}
 
 const CachedMesh = struct {
     vertices: []metal_renderer.Vertex,
     indices: []u32,
     in_use: bool,
+    selected: bool,
 };
 
 const MeshUpdateStats = struct {
     changed: bool,
     total_chunks: usize,
+    visible_chunks: usize,
     rendered_chunks: usize,
     culled_chunks: usize,
+    budget_skipped: usize,
     total_vertices: usize,
     total_indices: usize,
 };
+
+const max_render_chunks: usize = 96;
+const max_vertex_budget: usize = 12_000_000;
+const max_index_budget: usize = max_vertex_budget * 3;
 
 fn lerp(a: f32, b: f32, t: f32) f32 {
     return math.lerp(a, b, t);
@@ -175,12 +979,15 @@ fn updateGpuMeshes(
     combined_vertices: *std.ArrayListUnmanaged(metal_renderer.Vertex),
     combined_indices: *std.ArrayListUnmanaged(u32),
     frustum: math.Frustum,
+    camera_pos: math.Vec3,
 ) !MeshUpdateStats {
     var stats = MeshUpdateStats{
         .changed = false,
         .total_chunks = chunk_manager.chunks.count(),
+        .visible_chunks = 0,
         .rendered_chunks = 0,
         .culled_chunks = 0,
+        .budget_skipped = 0,
         .total_vertices = 0,
         .total_indices = 0,
     };
@@ -193,14 +1000,23 @@ fn updateGpuMeshes(
     var cache_it = mesh_cache.iterator();
     while (cache_it.next()) |entry| {
         entry.value_ptr.in_use = false;
+        entry.value_ptr.selected = false;
     }
+
+    const ChunkCandidate = struct {
+        key: u64,
+        chunk_ptr: *terrain.Chunk,
+        distance2: f32,
+    };
+
+    var candidates = std.ArrayListUnmanaged(ChunkCandidate){};
+    defer candidates.deinit(allocator);
 
     var chunk_it = chunk_manager.chunks.iterator();
     while (chunk_it.next()) |entry| {
         const key = entry.key_ptr.*;
         const chunk_ptr = entry.value_ptr.*;
 
-        // Frustum culling to avoid rendering off-screen chunks
         const chunk_size_f32 = @as(f32, @floatFromInt(terrain.Chunk.CHUNK_SIZE));
         const chunk_x = @as(f32, @floatFromInt(chunk_ptr.x)) * chunk_size_f32;
         const chunk_z = @as(f32, @floatFromInt(chunk_ptr.z)) * chunk_size_f32;
@@ -218,7 +1034,35 @@ fn updateGpuMeshes(
             continue;
         }
 
-        stats.rendered_chunks += 1;
+        stats.visible_chunks += 1;
+
+        const chunk_center_x = chunk_x + chunk_size_f32 * 0.5;
+        const chunk_center_z = chunk_z + chunk_size_f32 * 0.5;
+        const dx = chunk_center_x - camera_pos.x;
+        const dz = chunk_center_z - camera_pos.z;
+        const dist2 = dx * dx + dz * dz;
+
+        try candidates.append(allocator, .{
+            .key = key,
+            .chunk_ptr = chunk_ptr,
+            .distance2 = dist2,
+        });
+    }
+
+    if (candidates.items.len > 1) {
+        std.sort.insertion(ChunkCandidate, candidates.items, {}, struct {
+            fn lessThan(_: void, a: ChunkCandidate, b: ChunkCandidate) bool {
+                return a.distance2 < b.distance2;
+            }
+        }.lessThan);
+    }
+
+    var vertex_budget_used: usize = 0;
+    var index_budget_used: usize = 0;
+
+    for (candidates.items) |candidate| {
+        const key = candidate.key;
+        const chunk_ptr = candidate.chunk_ptr;
 
         var cache_entry_ptr_opt = mesh_cache.getPtr(key);
         if (cache_entry_ptr_opt == null) {
@@ -226,6 +1070,7 @@ fn updateGpuMeshes(
                 .vertices = &[_]metal_renderer.Vertex{},
                 .indices = &[_]u32{},
                 .in_use = false,
+                .selected = false,
             });
             cache_entry_ptr_opt = mesh_cache.getPtr(key);
             stats.changed = true;
@@ -233,89 +1078,109 @@ fn updateGpuMeshes(
 
         const cache_entry_ptr = cache_entry_ptr_opt.?;
         var cache_entry = cache_entry_ptr.*;
+        const was_selected = cache_entry.selected;
+
+        cache_entry.selected = false;
+        cache_entry.in_use = true;
 
         if (chunk_ptr.modified or cache_entry.vertices.len == 0) {
-            // Skip mesh generation if we've hit the per-frame limit
-            if (meshes_generated_this_frame >= max_meshes_per_frame) {
-                // Keep the chunk in the iteration but don't mesh it this frame
-                cache_entry.in_use = true;
-                cache_entry_ptr.* = cache_entry;
-                continue;
-            }
+            if (meshes_generated_this_frame < max_meshes_per_frame) {
+                if (cache_entry.vertices.len > 0) allocator.free(cache_entry.vertices);
+                if (cache_entry.indices.len > 0) allocator.free(cache_entry.indices);
 
-            if (cache_entry.vertices.len > 0) allocator.free(cache_entry.vertices);
-            if (cache_entry.indices.len > 0) allocator.free(cache_entry.indices);
-            stats.changed = true;
+                var chunk_mesh = try mesher.generateMesh(chunk_ptr);
+                defer chunk_mesh.deinit();
+                meshes_generated_this_frame += 1;
 
-            var chunk_mesh = try mesher.generateMesh(chunk_ptr);
-            defer chunk_mesh.deinit();
-            meshes_generated_this_frame += 1;
+                const vertex_count = chunk_mesh.vertices.items.len;
+                const index_count = chunk_mesh.indices.items.len;
 
-            const vertex_count = chunk_mesh.vertices.items.len;
-            const index_count = chunk_mesh.indices.items.len;
+                if (vertex_count == 0 or index_count == 0) {
+                    cache_entry.vertices = &[_]metal_renderer.Vertex{};
+                    cache_entry.indices = &[_]u32{};
+                    cache_entry.in_use = false;
+                    cache_entry.selected = false;
+                } else {
+                    var new_vertices = try allocator.alloc(metal_renderer.Vertex, vertex_count);
+                    const new_indices = try allocator.alloc(u32, index_count);
 
-            if (vertex_count == 0 or index_count == 0) {
-                cache_entry.vertices = &[_]metal_renderer.Vertex{};
-                cache_entry.indices = &[_]u32{};
-            } else {
-                var new_vertices = try allocator.alloc(metal_renderer.Vertex, vertex_count);
-                const new_indices = try allocator.alloc(u32, index_count);
+                    const size_i32: i32 = @intCast(terrain.Chunk.CHUNK_SIZE);
+                    const origin_x = @as(f32, @floatFromInt(chunk_ptr.x * size_i32));
+                    const origin_z = @as(f32, @floatFromInt(chunk_ptr.z * size_i32));
 
-                const size_i32: i32 = @intCast(terrain.Chunk.CHUNK_SIZE);
-                const origin_x = @as(f32, @floatFromInt(chunk_ptr.x * size_i32));
-                const origin_z = @as(f32, @floatFromInt(chunk_ptr.z * size_i32));
+                    for (chunk_mesh.vertices.items, 0..) |src_vertex, i| {
+                        const base_color = blockTypeColor(src_vertex.block_type);
+                        const ao = src_vertex.ao;
+                        const tile = blockTypeAtlasTile(src_vertex.block_type);
 
-                for (chunk_mesh.vertices.items, 0..) |src_vertex, i| {
-                    const base_color = blockTypeColor(src_vertex.block_type);
-                    const ao = src_vertex.ao;
-                    const tile = blockTypeAtlasTile(src_vertex.block_type);
+                        const uv_raw_u = src_vertex.tex_coords[0];
+                        const uv_raw_v = src_vertex.tex_coords[1];
+                        const frac_u = uv_raw_u - @floor(uv_raw_u);
+                        const frac_v = uv_raw_v - @floor(uv_raw_v);
+                        const tile_base_u = @as(f32, @floatFromInt(tile[0])) * atlas_tile_size;
+                        const tile_base_v = @as(f32, @floatFromInt(tile[1])) * atlas_tile_size;
+                        const final_u = tile_base_u + frac_u * atlas_tile_size;
+                        const final_v = tile_base_v + frac_v * atlas_tile_size;
 
-                    const uv_raw_u = src_vertex.tex_coords[0];
-                    const uv_raw_v = src_vertex.tex_coords[1];
-                    const frac_u = uv_raw_u - @floor(uv_raw_u);
-                    const frac_v = uv_raw_v - @floor(uv_raw_v);
-                    const tile_base_u = @as(f32, @floatFromInt(tile[0])) * atlas_tile_size;
-                    const tile_base_v = @as(f32, @floatFromInt(tile[1])) * atlas_tile_size;
-                    const final_u = tile_base_u + frac_u * atlas_tile_size;
-                    const final_v = tile_base_v + frac_v * atlas_tile_size;
+                        new_vertices[i] = .{
+                            .position = [3]f32{
+                                origin_x + src_vertex.position[0],
+                                src_vertex.position[1],
+                                origin_z + src_vertex.position[2],
+                            },
+                            .normal = src_vertex.normal,
+                            .tex_coord = [2]f32{ final_u, final_v },
+                            .color = [4]f32{
+                                base_color[0] * ao,
+                                base_color[1] * ao,
+                                base_color[2] * ao,
+                                1.0,
+                            },
+                        };
+                    }
 
-                    new_vertices[i] = .{
-                        .position = [3]f32{
-                            origin_x + src_vertex.position[0],
-                            src_vertex.position[1],
-                            origin_z + src_vertex.position[2],
-                        },
-                        .normal = src_vertex.normal,
-                        .tex_coord = [2]f32{ final_u, final_v },
-                        .color = [4]f32{
-                            base_color[0] * ao,
-                            base_color[1] * ao,
-                            base_color[2] * ao,
-                            1.0,
-                        },
-                    };
+                    std.mem.copyForwards(u32, new_indices, chunk_mesh.indices.items);
+
+                    cache_entry.vertices = new_vertices;
+                    cache_entry.indices = new_indices;
+                    cache_entry.in_use = true;
                 }
 
-                std.mem.copyForwards(u32, new_indices, chunk_mesh.indices.items);
-
-                cache_entry.vertices = new_vertices;
-                cache_entry.indices = new_indices;
+                chunk_ptr.modified = false;
+                stats.changed = true;
             }
+        }
 
-            chunk_ptr.modified = false;
+        const vertex_count = cache_entry.vertices.len;
+        const index_count = cache_entry.indices.len;
+        if (vertex_count == 0 or index_count == 0) {
+            if (was_selected) stats.changed = true;
+            cache_entry.in_use = false;
+            cache_entry.selected = false;
+            cache_entry_ptr.* = cache_entry;
+            continue;
+        }
+
+        if (stats.rendered_chunks >= max_render_chunks or
+            vertex_budget_used + vertex_count > max_vertex_budget or
+            index_budget_used + index_count > max_index_budget)
+        {
+            stats.budget_skipped += 1;
+            cache_entry.in_use = true;
+            cache_entry.selected = false;
+            if (was_selected) stats.changed = true;
+            cache_entry_ptr.* = cache_entry;
+            continue;
         }
 
         cache_entry.in_use = true;
+        cache_entry.selected = true;
+        if (!was_selected) stats.changed = true;
         cache_entry_ptr.* = cache_entry;
 
-        if (cache_entry.vertices.len == 0 or cache_entry.indices.len == 0) continue;
-
-        const base_vertex = @as(u32, @intCast(combined_vertices.items.len));
-        try combined_vertices.appendSlice(allocator, cache_entry.vertices);
-        try combined_indices.ensureTotalCapacity(allocator, combined_indices.items.len + cache_entry.indices.len);
-        for (cache_entry.indices) |idx| {
-            combined_indices.appendAssumeCapacity(base_vertex + idx);
-        }
+        vertex_budget_used += vertex_count;
+        index_budget_used += index_count;
+        stats.rendered_chunks += 1;
     }
 
     var keys_to_remove = std.ArrayListUnmanaged(u64){};
@@ -344,6 +1209,7 @@ fn updateGpuMeshes(
         var rebuild_it = mesh_cache.iterator();
         while (rebuild_it.next()) |entry| {
             const cached = entry.value_ptr.*;
+            if (!cached.selected) continue;
             if (cached.vertices.len == 0 or cached.indices.len == 0) continue;
 
             const base_vertex = @as(u32, @intCast(combined_vertices.items.len));
@@ -387,6 +1253,17 @@ pub fn runConsoleDemo(allocator: std.mem.Allocator) !void {
     // Generate initial chunks
     std.debug.print("[World] Generating initial chunks...\n", .{});
     try chunk_manager.update(player_physics.position, main_camera.front);
+    if (chunk_manager.takeAutosaveSummary()) |summary| {
+        const duration_ms = @as(f64, @floatFromInt(summary.duration_ns)) / 1_000_000.0;
+        const reason_str = switch (summary.reason) {
+            .timer => "auto",
+            .manual => "manual",
+        };
+        std.debug.print(
+            "[Autosave] Saved {d} chunks ({d} errors) in {d:.2} ms ({s})\n",
+            .{ summary.saved_chunks, summary.errors, duration_ms, reason_str },
+        );
+    }
 
     viz.displayChunkStats(&chunk_manager);
 
@@ -456,6 +1333,29 @@ pub fn runConsoleDemo(allocator: std.mem.Allocator) !void {
 
         // Update chunk loading
         try chunk_manager.update(player_physics.position, main_camera.front);
+        if (chunk_manager.takeAutosaveSummary()) |summary| {
+            const duration_ms = @as(f64, @floatFromInt(summary.duration_ns)) / 1_000_000.0;
+            const reason_str = switch (summary.reason) {
+                .timer => "auto",
+                .manual => "manual",
+            };
+            std.debug.print(
+                "[Autosave] Saved {d} chunks ({d} errors) in {d:.2} ms ({s})\n",
+                .{ summary.saved_chunks, summary.errors, duration_ms, reason_str },
+            );
+        }
+
+        if (chunk_manager.takeAutosaveSummary()) |summary| {
+            const duration_ms = @as(f64, @floatFromInt(summary.duration_ns)) / 1_000_000.0;
+            const reason_str = switch (summary.reason) {
+                .timer => "auto",
+                .manual => "manual",
+            };
+            std.debug.print(
+                "[Autosave] Saved {d} chunks ({d} errors) in {d:.2} ms ({s})\n",
+                .{ summary.saved_chunks, summary.errors, duration_ms, reason_str },
+            );
+        }
 
         const update_time = std.time.nanoTimestamp();
 
@@ -535,6 +1435,15 @@ pub fn runInteractiveDemo(allocator: std.mem.Allocator, options: DemoOptions) !v
         std.debug.print("Tip: Set MTL_HUD_ENABLED=1 to show Metal Performance HUD\n", .{});
     }
 
+    var owned_world_name: ?[]u8 = null;
+    defer if (owned_world_name) |name| allocator.free(name);
+
+    var world_name_slice: []const u8 = options.world_name;
+    var world_seed = options.world_seed;
+    var force_new_world = options.force_new_world;
+
+    const should_prompt_world = options.world_seed == null and !options.force_new_world and std.mem.eql(u8, options.world_name, default_world_name);
+
     var window = try sdl.SDLWindow.init(1280, 720, "Open World - Interactive Demo");
     defer window.deinit();
 
@@ -542,13 +1451,133 @@ pub fn runInteractiveDemo(allocator: std.mem.Allocator, options: DemoOptions) !v
     defer metal_ctx.deinit();
     std.debug.print("✓ Metal device: {s}\n", .{metal_ctx.getDeviceName()});
 
+    const shader_source = try std.fs.cwd().readFileAlloc(allocator, "shaders/chunk.metal", 1024 * 1024);
+    defer allocator.free(shader_source);
+
+    const vertex_entry: []const u8 = "vertex_main";
+    const fragment_entry: []const u8 = "fragment_main";
+    try metal_ctx.createPipeline(shader_source, vertex_entry, fragment_entry, @sizeOf(metal_renderer.Vertex));
+    const ui_vertex_entry: []const u8 = "ui_vertex_main";
+    const ui_fragment_entry: []const u8 = "ui_fragment_main";
+    metal_ctx.createUIPipeline(ui_vertex_entry, ui_fragment_entry, @sizeOf(line_text.UIVertex)) catch |err| {
+        std.debug.print("Warning: failed to create UI pipeline: {any}\n", .{err});
+    };
+
     var input_state = input.InputState{};
     var render_mode = metal.RenderMode.normal;
 
-    const world_seed: u64 = 42;
+    if (should_prompt_world) {
+        if (try showWorldSelectionMenu(allocator, options.worlds_root, &window, &metal_ctx, &input_state)) |selection| {
+            owned_world_name = selection.name;
+            world_name_slice = owned_world_name.?;
+            world_seed = selection.seed;
+            force_new_world = selection.force_new;
+        } else {
+            std.debug.print("Exiting without selecting a world.\n", .{});
+            return;
+        }
+    }
+
+    window.setCursorLocked(true);
+    input_state.beginFrame();
+
+    // Initialize world persistence
+    var world_persistence = persistence.WorldPersistence.init(allocator, world_name_slice, .{
+        .seed = world_seed,
+        .force_new = force_new_world,
+        .worlds_root = options.worlds_root,
+    }) catch |err| switch (err) {
+        error.WorldAlreadyExists => {
+            std.debug.print("Error: world '{s}' already exists. Use a different name or omit --new-world.\n", .{world_name_slice});
+            if (owned_world_name) |name| allocator.free(name);
+            return err;
+        },
+        error.SeedMismatch => {
+            std.debug.print("Error: world '{s}' seed mismatch. Provide matching --seed or omit it.\n", .{world_name_slice});
+            if (owned_world_name) |name| allocator.free(name);
+            return err;
+        },
+        else => {
+            std.debug.print("Error: failed to open world '{s}': {any}\n", .{ world_name_slice, err });
+            if (owned_world_name) |name| allocator.free(name);
+            return err;
+        },
+    };
+    defer {
+        world_persistence.saveMetadata() catch |err| {
+            std.debug.print("Warning: Failed to save world metadata: {any}\n", .{err});
+        };
+        world_persistence.deinit();
+    }
+
+    std.debug.print("Loaded world '{s}' (seed {d})\n", .{ world_name_slice, world_persistence.seed() });
+
     const view_distance: i32 = 8;
-    var chunk_manager = try streaming.ChunkStreamingManager.init(allocator, world_seed, view_distance);
+    var chunk_manager = try streaming.ChunkStreamingManager.init(allocator, world_persistence.seed(), view_distance);
     defer chunk_manager.deinit();
+
+    // Connect persistence to chunk manager
+    chunk_manager.world_persistence = &world_persistence;
+    chunk_manager.syncPersistenceSettings();
+    chunk_manager.resetAutosaveTimer();
+
+    var autosave_presets = std.ArrayListUnmanaged(u32){};
+    defer autosave_presets.deinit(allocator);
+    try autosave_presets.appendSlice(allocator, &autosave_default_presets);
+
+    var autosave_preset_index: usize = 0;
+    const current_interval = chunk_manager.autosaveIntervalSeconds();
+    var autosave_found = false;
+    for (autosave_presets.items, 0..) |preset, idx| {
+        if (preset == current_interval) {
+            autosave_preset_index = idx;
+            autosave_found = true;
+            break;
+        }
+    }
+    if (!autosave_found and current_interval != 0) {
+        try autosave_presets.append(allocator, current_interval);
+        std.sort.heap(u32, autosave_presets.items, {}, struct {
+            fn lessThan(_: void, lhs: u32, rhs: u32) bool {
+                return lhs < rhs;
+            }
+        }.lessThan);
+        for (autosave_presets.items, 0..) |preset, idx| {
+            if (preset == current_interval) {
+                autosave_preset_index = idx;
+                break;
+            }
+        }
+    }
+    var backup_retention_presets = std.ArrayListUnmanaged(usize){};
+    defer backup_retention_presets.deinit(allocator);
+    try backup_retention_presets.appendSlice(allocator, &backup_default_presets);
+    var backup_retention_index: usize = 0;
+    const current_retention = chunk_manager.backupRetention();
+    {
+        var found = false;
+        for (backup_retention_presets.items, 0..) |preset, idx| {
+            if (preset == current_retention) {
+                backup_retention_index = idx;
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            try backup_retention_presets.append(allocator, current_retention);
+            std.sort.heap(usize, backup_retention_presets.items, {}, struct {
+                fn lessThan(_: void, lhs: usize, rhs: usize) bool {
+                    return lhs < rhs;
+                }
+            }.lessThan);
+            for (backup_retention_presets.items, 0..) |preset, idx| {
+                if (preset == current_retention) {
+                    backup_retention_index = idx;
+                    break;
+                }
+            }
+        }
+    }
 
     // Start async generation AFTER the manager is in its final location
     try chunk_manager.startAsyncGeneration();
@@ -573,23 +1602,29 @@ pub fn runInteractiveDemo(allocator: std.mem.Allocator, options: DemoOptions) !v
     var total_frames: u64 = 0;
     var fps_counter: u32 = 0;
     var fps_timer: f64 = 0;
+    var autosave_elapsed: f32 = 0;
+    var autosave_status_timer: f32 = 0;
+    var autosave_status_msg: []const u8 = "";
+
+    const autosave_status_cap: usize = 128;
+    const autosave_status_buffer = try allocator.alloc(u8, autosave_status_cap);
+    defer allocator.free(autosave_status_buffer);
+
+    const manual_message_buffer = try allocator.alloc(u8, autosave_status_cap);
+    defer allocator.free(manual_message_buffer);
 
     std.debug.print("Controls:\n", .{});
     std.debug.print("  Movement: WASD, Space/Ctrl (fly up/down), Shift (sprint), F (toggle fly)\n", .{});
     std.debug.print("  Blocks: Left Click (break), Right Click (place)\n", .{});
     std.debug.print("  Debug: F4 (toggle wireframe)\n", .{});
+    std.debug.print("  Autosave: F5 (cycle interval), F6 (manual save)\n", .{});
+    std.debug.print("  Backups: F7 (increase retention), F8 (decrease retention)\n", .{});
     std.debug.print("  ESC (unlock cursor), ESC again (quit)\n", .{});
 
     try chunk_manager.update(player_physics.position, main_camera.front);
 
     var mesher = mesh.GreedyMesher.init(allocator);
 
-    const shader_source = try std.fs.cwd().readFileAlloc(allocator, "shaders/chunk.metal", 1024 * 1024);
-    defer allocator.free(shader_source);
-
-    const vertex_entry: []const u8 = "vertex_main";
-    const fragment_entry: []const u8 = "fragment_main";
-    try metal_ctx.createPipeline(shader_source, vertex_entry, fragment_entry, @sizeOf(metal_renderer.Vertex));
     var atlas = try textures.generateAtlas(allocator);
     defer atlas.deinit(allocator);
     try metal_ctx.setTexture(atlas.data, atlas.width, atlas.height, atlas.width * textures.channels);
@@ -608,6 +1643,8 @@ pub fn runInteractiveDemo(allocator: std.mem.Allocator, options: DemoOptions) !v
     defer combined_vertices.deinit(allocator);
     var combined_indices = std.ArrayListUnmanaged(u32){};
     defer combined_indices.deinit(allocator);
+    var hud_vertices = std.ArrayListUnmanaged(line_text.UIVertex){};
+    defer hud_vertices.deinit(allocator);
 
     const model_matrix = math.Mat4.identity();
     var time_of_day: f32 = 0.25; // 0 = midnight, 0.25 = sunrise
@@ -639,6 +1676,69 @@ pub fn runInteractiveDemo(allocator: std.mem.Allocator, options: DemoOptions) !v
             std.debug.print("Render Mode: {s}\n", .{render_mode.name()});
         }
 
+        if (input_state.wasKeyPressed(.f5)) {
+            autosave_preset_index = (autosave_preset_index + 1) % autosave_presets.items.len;
+            const interval = autosave_presets.items[autosave_preset_index];
+            chunk_manager.setAutosaveIntervalSeconds(interval);
+            chunk_manager.resetAutosaveTimer();
+            if (interval == 0) {
+                std.debug.print("Autosave disabled.\n", .{});
+            } else {
+                std.debug.print("Autosave interval set to {d} seconds.\n", .{interval});
+            }
+            autosave_elapsed = 0;
+            const msg = if (chunk_manager.autosaveIntervalSeconds() == 0)
+                "Autosave: off"
+            else
+                std.fmt.bufPrint(autosave_status_buffer, "Autosave: every {d}s", .{chunk_manager.autosaveIntervalSeconds()}) catch "Autosave interval set";
+            autosave_status_msg = msg;
+            autosave_status_timer = 4.0;
+        }
+
+        if (input_state.wasKeyPressed(.f6)) {
+            if (chunk_manager.forceAutosave()) |summary| {
+                const duration_ms = @as(f64, @floatFromInt(summary.duration_ns)) / 1_000_000.0;
+                std.debug.print(
+                    "[Autosave] Manual save: saved {d} chunks ({d} errors) in {d:.2} ms\n",
+                    .{ summary.saved_chunks, summary.errors, duration_ms },
+                );
+                const msg = std.fmt.bufPrint(manual_message_buffer, "Manual save: {d} chunks ({d} errors)", .{ summary.saved_chunks, summary.errors }) catch "Manual save";
+                autosave_status_msg = msg;
+                autosave_status_timer = 4.0;
+            } else {
+                std.debug.print("[Autosave] Manual save: no modified chunks\n", .{});
+                autosave_status_msg = "Manual save: no changes";
+                autosave_status_timer = 4.0;
+            }
+            autosave_elapsed = 0;
+        }
+
+        if (input_state.wasKeyPressed(.f7)) {
+            if (chunk_manager.world_persistence) |_| {
+                if (backup_retention_index + 1 < backup_retention_presets.items.len) {
+                    backup_retention_index += 1;
+                }
+                const retention = backup_retention_presets.items[backup_retention_index];
+                chunk_manager.setBackupRetention(retention);
+                std.debug.print("Backups retention set to {d} copies per region.\n", .{retention});
+                autosave_status_msg = std.fmt.bufPrint(autosave_status_buffer, "Backups: keep {d}", .{retention}) catch "Backups retention set";
+                autosave_status_timer = 4.0;
+            } else {
+                std.debug.print("Backups retention control unavailable: no persistence backend.\n", .{});
+            }
+        } else if (input_state.wasKeyPressed(.f8)) {
+            if (chunk_manager.world_persistence) |_| {
+                if (backup_retention_index > 0) {
+                    backup_retention_index -= 1;
+                }
+                const retention = backup_retention_presets.items[backup_retention_index];
+                chunk_manager.setBackupRetention(retention);
+                std.debug.print("Backups retention set to {d} copies per region.\n", .{retention});
+                autosave_status_msg = std.fmt.bufPrint(autosave_status_buffer, "Backups: keep {d}", .{retention}) catch "Backups retention set";
+                autosave_status_timer = 4.0;
+            }
+        }
+
         player_physics.setSprinting(input_state.isKeyDown(.shift_left));
         player_physics.setSneaking(false);
 
@@ -649,6 +1749,14 @@ pub fn runInteractiveDemo(allocator: std.mem.Allocator, options: DemoOptions) !v
         const delta_seconds = @as(f64, @floatFromInt(delta_ns)) / 1_000_000_000.0;
         accumulator += delta_seconds;
         fps_timer += delta_seconds;
+        autosave_elapsed += @as(f32, @floatCast(delta_seconds));
+        if (autosave_status_timer > 0) {
+            autosave_status_timer -= @as(f32, @floatCast(delta_seconds));
+            if (autosave_status_timer <= 0) {
+                autosave_status_timer = 0;
+                autosave_status_msg = "";
+            }
+        }
 
         time_of_day += @as(f32, @floatCast(delta_seconds)) / day_length_seconds;
         if (time_of_day >= 1.0) time_of_day -= 1.0;
@@ -762,6 +1870,20 @@ pub fn runInteractiveDemo(allocator: std.mem.Allocator, options: DemoOptions) !v
             main_camera.setPosition(player_physics.getEyePosition());
 
             try chunk_manager.update(player_physics.position, main_camera.front);
+            if (chunk_manager.takeAutosaveSummary()) |summary| {
+                const duration_ms = @as(f64, @floatFromInt(summary.duration_ns)) / 1_000_000.0;
+                const reason_str = switch (summary.reason) {
+                    .timer => "auto",
+                    .manual => "manual",
+                };
+                std.debug.print(
+                    "[Autosave] Saved {d} chunks ({d} errors) in {d:.2} ms ({s})\n",
+                    .{ summary.saved_chunks, summary.errors, duration_ms, reason_str },
+                );
+                autosave_status_msg = std.fmt.bufPrint(autosave_status_buffer, "Autosave: {d} chunks ({d} errors)", .{ summary.saved_chunks, summary.errors }) catch "Autosave complete";
+                autosave_status_timer = 4.0;
+                autosave_elapsed = 0;
+            }
 
             accumulator -= fixed_dt_seconds;
         }
@@ -772,7 +1894,109 @@ pub fn runInteractiveDemo(allocator: std.mem.Allocator, options: DemoOptions) !v
         const view_proj = projection.multiply(view);
         const frustum = math.Frustum.fromMatrix(view_proj);
 
-        const mesh_stats = try updateGpuMeshes(allocator, &chunk_manager, &mesh_cache, &mesher, &combined_vertices, &combined_indices, frustum);
+        const camera_pos = main_camera.getPosition();
+        const mesh_stats = try updateGpuMeshes(allocator, &chunk_manager, &mesh_cache, &mesher, &combined_vertices, &combined_indices, frustum, camera_pos);
+        const has_mesh = combined_vertices.items.len > 0;
+
+        if (selected_block) |sel| {
+            const outline_vertices = try generateCubeOutlineVertices(allocator, sel.block_pos, 0.01);
+            defer allocator.free(outline_vertices);
+            if (outline_vertices.len > 0) {
+                const outline_bytes = std.mem.sliceAsBytes(outline_vertices);
+                try metal_ctx.setLineMesh(outline_bytes, @sizeOf(metal_renderer.Vertex));
+            } else {
+                try metal_ctx.setLineMesh(&[_]u8{}, @sizeOf(metal_renderer.Vertex));
+            }
+        } else {
+            try metal_ctx.setLineMesh(&[_]u8{}, @sizeOf(metal_renderer.Vertex));
+        }
+
+        if (has_mesh) {
+            hud_vertices.clearRetainingCapacity();
+            var hud_texts: [4][]const u8 = .{ "", "", "", "" };
+            var hud_count: usize = 0;
+            var max_width: f32 = 0;
+            const hud_scale: f32 = 16.0;
+            const hud_line_height = line_text.lineHeightPx(hud_scale);
+            const hud_padding = 12.0;
+
+            var countdown_buf: [48]u8 = undefined;
+            const autosave_interval = chunk_manager.autosaveIntervalSeconds();
+            const autosave_line: []const u8 = if (autosave_interval == 0)
+                "Autosave: OFF"
+            else blk: {
+                const interval_f = @as(f32, @floatFromInt(autosave_interval));
+                const remaining = @max(0.0, interval_f - autosave_elapsed);
+                break :blk std.fmt.bufPrint(&countdown_buf, "Autosave: next ~{d:.0}s", .{std.math.ceil(remaining)}) catch "Autosave countdown";
+            };
+            hud_texts[hud_count] = autosave_line;
+            hud_count += 1;
+            max_width = line_text.textWidth(autosave_line, hud_scale);
+
+            if (autosave_status_msg.len > 0) {
+                hud_texts[hud_count] = autosave_status_msg;
+                hud_count += 1;
+                max_width = @max(max_width, line_text.textWidth(autosave_status_msg, hud_scale));
+            }
+
+            if (chunk_manager.world_persistence) |wp| {
+                const backup_status = wp.backupStatus();
+                if (backup_status.retained > 0 or backup_status.last_backup_timestamp != 0) {
+                    var time_buf: [32]u8 = undefined;
+                    const time_str = if (backup_status.last_backup_timestamp != 0)
+                        formatTimestamp(&time_buf, backup_status.last_backup_timestamp)
+                    else
+                        "none";
+
+                    var backup_buf: [96]u8 = undefined;
+                    const backup_line = std.fmt.bufPrint(
+                        &backup_buf,
+                        "Backups: {d}/{d} (last {s})",
+                        .{ backup_status.retained, backup_status.retention_limit, time_str },
+                    ) catch "Backups: status";
+
+                    hud_texts[hud_count] = backup_line;
+                    hud_count += 1;
+                    max_width = @max(max_width, line_text.textWidth(backup_line, hud_scale));
+                }
+            }
+
+            if (hud_count > 0) {
+                const screen_size = math.Vec2.init(@floatFromInt(window.width), @floatFromInt(window.height));
+                const panel_width = max_width + hud_padding * 2.0;
+                const panel_height = @as(f32, @floatFromInt(hud_count)) * hud_line_height + hud_padding * 2.0;
+                const margin = math.Vec2.init(24.0, 24.0);
+                const origin = math.Vec2.init(
+                    screen_size.x - panel_width - margin.x,
+                    screen_size.y - panel_height - margin.y,
+                );
+
+                try line_text.appendQuad(
+                    &hud_vertices,
+                    allocator,
+                    origin,
+                    origin.add(math.Vec2.init(panel_width, panel_height)),
+                    screen_size,
+                    [4]f32{ 0.04, 0.05, 0.08, 0.78 },
+                );
+
+                var cursor = origin.add(math.Vec2.init(hud_padding, hud_padding));
+                var line_index: usize = 0;
+                while (line_index < hud_count) : (line_index += 1) {
+                    try line_text.appendText(&hud_vertices, allocator, hud_texts[line_index], cursor, hud_scale, screen_size, [4]f32{ 0.9, 0.96, 1.0, 1.0 });
+                    cursor.y += hud_line_height;
+                }
+            }
+
+            if (hud_vertices.items.len == 0) {
+                try metal_ctx.setUIMesh(&[_]u8{}, @sizeOf(line_text.UIVertex));
+            } else {
+                const hud_bytes = std.mem.sliceAsBytes(hud_vertices.items);
+                try metal_ctx.setUIMesh(hud_bytes, @sizeOf(line_text.UIVertex));
+            }
+        } else {
+            try metal_ctx.setUIMesh(&[_]u8{}, @sizeOf(line_text.UIVertex));
+        }
 
         total_frames += 1;
         fps_counter += 1;
@@ -801,7 +2025,6 @@ pub fn runInteractiveDemo(allocator: std.mem.Allocator, options: DemoOptions) !v
             lerp(sky_color_night.z, sky_color_day.z, day_factor),
         );
 
-        const has_mesh = combined_vertices.items.len > 0;
         if (mesh_stats.changed and has_mesh) {
             try metal_ctx.setMesh(
                 std.mem.sliceAsBytes(combined_vertices.items),
@@ -810,7 +2033,6 @@ pub fn runInteractiveDemo(allocator: std.mem.Allocator, options: DemoOptions) !v
             );
         }
 
-        const camera_pos = main_camera.getPosition();
         const fog_start: f32 = 40.0;
         const fog_range: f32 = 80.0;
 
@@ -831,19 +2053,6 @@ pub fn runInteractiveDemo(allocator: std.mem.Allocator, options: DemoOptions) !v
                 .fog_params = [4]f32{ 0.0, fog_start, fog_range, 0.0 },
             };
 
-            // Set up line mesh for block selection outline if a block is selected
-            if (selected_block) |sel| {
-                const outline_vertices = try generateCubeOutlineVertices(allocator, sel.block_pos, 0.01);
-                defer allocator.free(outline_vertices);
-                try metal_ctx.setLineMesh(
-                    std.mem.sliceAsBytes(outline_vertices),
-                    @sizeOf(metal_renderer.Vertex),
-                );
-            } else {
-                // Clear line mesh
-                try metal_ctx.setLineMesh(&[_]u8{}, @sizeOf(metal_renderer.Vertex));
-            }
-
             try metal_ctx.setUniforms(std.mem.asBytes(&uniforms));
             try metal_ctx.draw(.{ sky_color_vec.x, sky_color_vec.y, sky_color_vec.z, 1.0 });
         } else {
@@ -855,19 +2064,45 @@ pub fn runInteractiveDemo(allocator: std.mem.Allocator, options: DemoOptions) !v
 
         if (fps_timer >= 1.0) {
             std.debug.print(
-                "FPS ~{d: >3} | Pos ({d:.1}, {d:.1}, {d:.1}) | Chunks {d}/{d} ({d} culled) | Verts {d} Tris {d}\n",
+                "FPS ~{d: >3} | Pos ({d:.1}, {d:.1}, {d:.1}) | Chunks {d}/{d} vis/{d} total (culled {d}, budget {d}) | Verts {d} Tris {d}\n",
                 .{
                     fps_counter,
                     player_physics.position.x,
                     player_physics.position.y,
                     player_physics.position.z,
                     mesh_stats.rendered_chunks,
+                    mesh_stats.visible_chunks,
                     mesh_stats.total_chunks,
                     mesh_stats.culled_chunks,
+                    mesh_stats.budget_skipped,
                     mesh_stats.total_vertices,
                     mesh_stats.total_indices / 3,
                 },
             );
+            const autosave_interval_console = chunk_manager.autosaveIntervalSeconds();
+            if (autosave_interval_console == 0) {
+                std.debug.print("Autosave: off\n", .{});
+            } else {
+                const remaining = @max(0.0, @as(f32, @floatFromInt(autosave_interval_console)) - autosave_elapsed);
+                std.debug.print("Autosave: next in ~{d:.1}s\n", .{remaining});
+            }
+            if (autosave_status_msg.len > 0) {
+                std.debug.print("Autosave status: {s}\n", .{autosave_status_msg});
+            }
+            if (chunk_manager.world_persistence) |wp| {
+                const backup_status = wp.backupStatus();
+                if (backup_status.retained > 0 or backup_status.last_backup_timestamp != 0) {
+                    var time_buf: [32]u8 = undefined;
+                    const time_str = if (backup_status.last_backup_timestamp != 0)
+                        formatTimestamp(&time_buf, backup_status.last_backup_timestamp)
+                    else
+                        "never";
+                    std.debug.print(
+                        "Backups: {d}/{d} (last {s})\n",
+                        .{ backup_status.retained, backup_status.retention_limit, time_str },
+                    );
+                }
+            }
             fps_counter = 0;
             fps_timer -= 1.0;
         }

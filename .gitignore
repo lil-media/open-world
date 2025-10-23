@@ -1,18 +1,11 @@
-.zig-cache
+# Zig build artifacts
+.zig-cache/
 zig-out/
+zig-global-cache/
 
-# macOS
+# Runtime worlds created by the demo
+worlds/
+
+# OS metadata
 .DS_Store
 
-# Editor files
-.vscode/
-.idea/
-*.swp
-*.swo
-*~
-
-# Build artifacts
-*.o
-*.a
-*.so
-*.dylib

@@ -1,6 +1,7 @@
 const std = @import("std");
 const terrain = @import("terrain.zig");
 const generator = @import("generator.zig");
+const persistence = @import("persistence.zig");
 const math = @import("../utils/math.zig");
 
 /// Chunk position (x, z coordinates)
@@ -95,6 +96,19 @@ pub const ChunkState = enum {
     unloading, // Being saved and removed
 };
 
+const AutosaveReason = enum {
+    timer,
+    manual,
+};
+
+const AutosaveSummary = struct {
+    timestamp_ns: i128,
+    saved_chunks: u32,
+    errors: u32,
+    duration_ns: i128,
+    reason: AutosaveReason,
+};
+
 /// Chunk streaming manager
 pub const ChunkStreamingManager = struct {
     allocator: std.mem.Allocator,
@@ -113,6 +127,9 @@ pub const ChunkStreamingManager = struct {
     // Terrain generator
     terrain_gen: generator.TerrainGenerator,
 
+    // World persistence
+    world_persistence: ?*persistence.WorldPersistence,
+
     // Async generation - NEW approach using dedicated worker thread
     generation_thread: ?std.Thread,
     generation_mutex: std.Thread.Mutex,
@@ -121,6 +138,13 @@ pub const ChunkStreamingManager = struct {
     completed_chunks: std.ArrayList(ChunkPos), // Ready to be moved to main chunks
     should_stop: std.atomic.Value(bool),
     use_async: bool,
+
+    // Persistence/autosave
+    autosave_interval_ns: i128,
+    last_autosave_ns: i128,
+    autosave_interval_seconds: u32,
+    last_autosave_summary: ?AutosaveSummary,
+    backup_retention: usize,
 
     // Settings
     view_distance: i32, // In chunks
@@ -153,6 +177,7 @@ pub const ChunkStreamingManager = struct {
             .load_queue = std.PriorityQueue(ChunkRequest, void, ChunkRequest.lessThan).init(allocator, {}),
             .unload_queue = ArrayListChunkPos{},
             .terrain_gen = generator.TerrainGenerator.init(seed),
+            .world_persistence = null,
             .generation_thread = null,
             .generation_mutex = .{},
             .generation_queue = ArrayListChunkPos{},
@@ -160,6 +185,11 @@ pub const ChunkStreamingManager = struct {
             .completed_chunks = ArrayListChunkPos{},
             .should_stop = std.atomic.Value(bool).init(false),
             .use_async = use_async,
+            .autosave_interval_ns = 30 * @as(i128, std.time.ns_per_s),
+            .last_autosave_ns = std.time.nanoTimestamp(),
+            .autosave_interval_seconds = 30,
+            .last_autosave_summary = null,
+            .backup_retention = persistence.default_region_backup_retention,
             .view_distance = view_distance,
             .unload_distance = view_distance + 2, // Hysteresis
             .max_chunks_per_frame = 4,
@@ -229,35 +259,18 @@ pub const ChunkStreamingManager = struct {
             }
         }
 
-        var it = self.chunks.valueIterator();
-        while (it.next()) |chunk_ptr_ptr| {
-            const chunk_ptr = chunk_ptr_ptr.*;
-            self.removeTrackedChunk(chunk_ptr);
-            self.allocator.destroy(chunk_ptr);
-            std.debug.assert(self.allocated_chunks > 0);
-            self.allocated_chunks -= 1;
-        }
         self.chunks.clearRetainingCapacity();
         self.chunk_states.clearRetainingCapacity();
-
-        for (self.chunk_pool.items) |chunk| {
-            self.removeTrackedChunk(chunk);
-            self.allocator.destroy(chunk);
-            std.debug.assert(self.allocated_chunks > 0);
-            self.allocated_chunks -= 1;
-        }
         self.chunk_pool.clearRetainingCapacity();
 
         while (self.load_queue.removeOrNull()) |_| {}
         self.unload_queue.clearRetainingCapacity();
 
-        if (self.tracked_chunks.items.len != 0) {
-            for (self.tracked_chunks.items) |chunk| {
-                self.allocator.destroy(chunk);
-            }
-            self.allocated_chunks = 0;
-            self.tracked_chunks.clearRetainingCapacity();
+        for (self.tracked_chunks.items) |chunk_ptr| {
+            self.allocator.destroy(chunk_ptr);
         }
+        self.tracked_chunks.clearRetainingCapacity();
+        self.allocated_chunks = 0;
     }
 
     /// Update chunk loading based on player position
@@ -278,6 +291,11 @@ pub const ChunkStreamingManager = struct {
 
         // Process unloading
         try self.processUnloading();
+
+        self.autosaveIfDue();
+        if (self.world_persistence) |wp| {
+            wp.serviceMaintenance(1);
+        }
 
         if (std.debug.runtime_safety and !self.use_async) {
             // Account for chunks in all states: loaded, pooled, and pending (async)
@@ -458,14 +476,28 @@ pub const ChunkStreamingManager = struct {
     fn loadChunk(self: *ChunkStreamingManager, pos: ChunkPos) !void {
         const hash_val = pos.hash();
 
-        // Get or create chunk
-        const chunk = try self.acquireChunk();
-        chunk.x = pos.x;
-        chunk.z = pos.z;
-        chunk.modified = false;
+        // Try to load from disk first if persistence is enabled
+        var chunk: *terrain.Chunk = undefined;
+        var loaded_from_disk = false;
 
-        // Generate terrain
-        self.terrain_gen.generateChunk(chunk);
+        if (self.world_persistence) |wp| {
+            if (try wp.loadChunk(pos.x, pos.z)) |loaded_chunk| {
+                chunk = try self.acquireChunk();
+                chunk.* = loaded_chunk;
+                loaded_from_disk = true;
+            }
+        }
+
+        // If not loaded from disk, generate new chunk
+        if (!loaded_from_disk) {
+            chunk = try self.acquireChunk();
+            chunk.x = pos.x;
+            chunk.z = pos.z;
+            chunk.modified = false;
+
+            // Generate terrain
+            self.terrain_gen.generateChunk(chunk);
+        }
 
         // Add to loaded chunks
         try self.chunks.put(hash_val, chunk);
@@ -490,13 +522,126 @@ pub const ChunkStreamingManager = struct {
         if (self.chunks.fetchRemove(hash_val)) |entry| {
             const chunk = entry.value;
 
-            // TODO: Save chunk if modified
+            // Save chunk if modified and persistence is enabled
+            if (chunk.modified and self.world_persistence != null) {
+                self.world_persistence.?.saveChunk(chunk) catch |err| {
+                    std.debug.print("Warning: Failed to save chunk ({d}, {d}): {any}\n", .{ chunk.x, chunk.z, err });
+                };
+            }
 
             // Return to pool
             try self.releaseChunk(chunk);
         }
 
         _ = self.chunk_states.remove(hash_val);
+    }
+
+    pub fn resetAutosaveTimer(self: *ChunkStreamingManager) void {
+        self.last_autosave_ns = std.time.nanoTimestamp();
+    }
+
+    pub fn setAutosaveIntervalSeconds(self: *ChunkStreamingManager, seconds: u32) void {
+        self.autosave_interval_seconds = seconds;
+        if (seconds == 0) {
+            self.autosave_interval_ns = 0;
+        } else {
+            const seconds_i128: i128 = @intCast(seconds);
+            self.autosave_interval_ns = seconds_i128 * @as(i128, std.time.ns_per_s);
+        }
+        if (self.world_persistence) |wp| {
+            wp.setAutosaveIntervalSeconds(seconds);
+        }
+    }
+
+    pub fn autosaveIntervalSeconds(self: *const ChunkStreamingManager) u32 {
+        return self.autosave_interval_seconds;
+    }
+
+    pub fn setBackupRetention(self: *ChunkStreamingManager, retention: usize) void {
+        self.backup_retention = retention;
+        if (self.world_persistence) |wp| {
+            wp.setRegionBackupRetention(retention);
+            self.backup_retention = wp.regionBackupRetention();
+        }
+    }
+
+    pub fn backupRetention(self: *const ChunkStreamingManager) usize {
+        return self.backup_retention;
+    }
+
+    pub fn syncPersistenceSettings(self: *ChunkStreamingManager) void {
+        if (self.world_persistence) |wp| {
+            const interval = wp.autosaveIntervalSeconds();
+            self.autosave_interval_seconds = interval;
+            if (interval == 0) {
+                self.autosave_interval_ns = 0;
+            } else {
+                const seconds_i128: i128 = @intCast(interval);
+                self.autosave_interval_ns = seconds_i128 * @as(i128, std.time.ns_per_s);
+            }
+            self.backup_retention = wp.regionBackupRetention();
+        }
+    }
+
+    pub fn takeAutosaveSummary(self: *ChunkStreamingManager) ?AutosaveSummary {
+        const result = self.last_autosave_summary;
+        self.last_autosave_summary = null;
+        return result;
+    }
+
+    pub fn forceAutosave(self: *ChunkStreamingManager) ?AutosaveSummary {
+        if (self.world_persistence == null) return null;
+        const summary = self.performAutosave(.manual);
+        if (summary) |info| {
+            self.last_autosave_ns = info.timestamp_ns;
+        } else {
+            self.last_autosave_ns = std.time.nanoTimestamp();
+        }
+        return summary;
+    }
+
+    fn autosaveIfDue(self: *ChunkStreamingManager) void {
+        if (self.world_persistence == null) return;
+        if (self.autosave_interval_ns == 0) return;
+
+        const now = std.time.nanoTimestamp();
+        if (now - self.last_autosave_ns < self.autosave_interval_ns) return;
+        self.last_autosave_ns = now;
+        if (self.performAutosave(.timer)) |summary| {
+            self.last_autosave_summary = summary;
+        }
+    }
+
+    fn performAutosave(self: *ChunkStreamingManager, reason: AutosaveReason) ?AutosaveSummary {
+        if (self.world_persistence == null) return null;
+
+        const start = std.time.nanoTimestamp();
+        var saved: u32 = 0;
+        var errors: u32 = 0;
+
+        var it = self.chunks.valueIterator();
+        while (it.next()) |chunk_ptr_ptr| {
+            const chunk = chunk_ptr_ptr.*;
+            if (!chunk.modified) continue;
+
+            self.world_persistence.?.saveChunk(chunk) catch |err| {
+                errors += 1;
+                std.debug.print("Warning: Autosave failed for chunk ({d}, {d}): {any}\n", .{ chunk.x, chunk.z, err });
+                continue;
+            };
+            saved += 1;
+        }
+
+        if (saved == 0 and errors == 0) return null;
+
+        const end = std.time.nanoTimestamp();
+        return AutosaveSummary{
+            .timestamp_ns = end,
+            .saved_chunks = saved,
+            .errors = errors,
+            .duration_ns = end - start,
+            .reason = reason,
+        };
     }
 
     fn acquireChunk(self: *ChunkStreamingManager) !*terrain.Chunk {

@@ -25,10 +25,14 @@ typedef struct {
     void* texture;
     void* sampler;
     void* line_buffer;
+    void* ui_pipeline;
+    void* ui_vertex_buffer;
     size_t vertex_stride;
     size_t index_count;
     size_t uniform_size;
     size_t line_vertex_count;
+    size_t ui_vertex_count;
+    size_t ui_vertex_stride;
     RenderMode render_mode;
 } MetalContext;
 
@@ -74,10 +78,14 @@ MetalContext* metal_create_context(void* sdl_metal_view) {
     ctx->texture = NULL;
     ctx->sampler = NULL;
     ctx->line_buffer = NULL;
+    ctx->ui_pipeline = NULL;
+    ctx->ui_vertex_buffer = NULL;
     ctx->vertex_stride = 0;
     ctx->index_count = 0;
     ctx->uniform_size = 0;
     ctx->line_vertex_count = 0;
+    ctx->ui_vertex_count = 0;
+    ctx->ui_vertex_stride = 0;
     ctx->render_mode = RenderModeNormal;
 
     return ctx;
@@ -89,7 +97,9 @@ void metal_destroy_context(MetalContext* ctx) {
         if (ctx->index_buffer) CFRelease(ctx->index_buffer);
         if (ctx->vertex_buffer) CFRelease(ctx->vertex_buffer);
         if (ctx->line_buffer) CFRelease(ctx->line_buffer);
+        if (ctx->ui_vertex_buffer) CFRelease(ctx->ui_vertex_buffer);
         if (ctx->pipeline) CFRelease(ctx->pipeline);
+        if (ctx->ui_pipeline) CFRelease(ctx->ui_pipeline);
         if (ctx->library) CFRelease(ctx->library);
         if (ctx->depth_state) CFRelease(ctx->depth_state);
         if (ctx->texture) CFRelease(ctx->texture);
@@ -166,6 +176,14 @@ bool metal_create_pipeline(MetalContext* ctx, const char* source, size_t source_
     vertexDescriptor.layouts[0].stride = vertex_stride;
     vertexDescriptor.layouts[0].stepFunction = MTLVertexStepFunctionPerVertex;
     descriptor.vertexDescriptor = vertexDescriptor;
+    descriptor.inputPrimitiveTopology = MTLPrimitiveTopologyClassTriangle;
+    descriptor.colorAttachments[0].blendingEnabled = YES;
+    descriptor.colorAttachments[0].rgbBlendOperation = MTLBlendOperationAdd;
+    descriptor.colorAttachments[0].alphaBlendOperation = MTLBlendOperationAdd;
+    descriptor.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorSourceAlpha;
+    descriptor.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+    descriptor.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorSourceAlpha;
+    descriptor.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
 
     NSError* pipelineError = nil;
     id<MTLRenderPipelineState> pipeline = [device newRenderPipelineStateWithDescriptor:descriptor error:&pipelineError];
@@ -188,6 +206,63 @@ bool metal_create_pipeline(MetalContext* ctx, const char* source, size_t source_
     metal_release_and_assign(&ctx->depth_state, (__bridge_retained void*)depthState);
     ctx->vertex_stride = vertex_stride;
 
+    return true;
+}
+
+bool metal_create_ui_pipeline(MetalContext* ctx, const char* vertex_name, size_t vertex_length, const char* fragment_name, size_t fragment_length, size_t vertex_stride) {
+    if (!ctx || !ctx->library || !vertex_name || vertex_length == 0 || !fragment_name || fragment_length == 0) {
+        return false;
+    }
+
+    id<MTLDevice> device = (__bridge id<MTLDevice>)ctx->device;
+    if (!device) return false;
+
+    id<MTLLibrary> library = (__bridge id<MTLLibrary>)ctx->library;
+
+    NSString* vertexString = [[NSString alloc] initWithBytes:vertex_name length:vertex_length encoding:NSUTF8StringEncoding];
+    NSString* fragmentString = [[NSString alloc] initWithBytes:fragment_name length:fragment_length encoding:NSUTF8StringEncoding];
+    if (!vertexString || !fragmentString) return false;
+
+    id<MTLFunction> vertexFunction = [library newFunctionWithName:vertexString];
+    id<MTLFunction> fragmentFunction = [library newFunctionWithName:fragmentString];
+    if (!vertexFunction || !fragmentFunction) {
+        NSLog(@"Failed to find UI shader functions");
+        return false;
+    }
+
+    CAMetalLayer* layer = (__bridge CAMetalLayer*)ctx->layer;
+    MTLPixelFormat pixelFormat = layer ? layer.pixelFormat : MTLPixelFormatBGRA8Unorm;
+    if (pixelFormat == MTLPixelFormatInvalid) {
+        pixelFormat = MTLPixelFormatBGRA8Unorm;
+    }
+
+    MTLRenderPipelineDescriptor* descriptor = [MTLRenderPipelineDescriptor new];
+    descriptor.vertexFunction = vertexFunction;
+    descriptor.fragmentFunction = fragmentFunction;
+    descriptor.colorAttachments[0].pixelFormat = pixelFormat;
+    descriptor.depthAttachmentPixelFormat = MTLPixelFormatInvalid;
+
+    MTLVertexDescriptor* vertexDescriptor = [MTLVertexDescriptor vertexDescriptor];
+    vertexDescriptor.attributes[0].format = MTLVertexFormatFloat2;
+    vertexDescriptor.attributes[0].offset = 0;
+    vertexDescriptor.attributes[0].bufferIndex = 0;
+    vertexDescriptor.attributes[1].format = MTLVertexFormatFloat4;
+    vertexDescriptor.attributes[1].offset = sizeof(float) * 2;
+    vertexDescriptor.attributes[1].bufferIndex = 0;
+    vertexDescriptor.layouts[0].stride = vertex_stride;
+    vertexDescriptor.layouts[0].stepFunction = MTLVertexStepFunctionPerVertex;
+
+    descriptor.vertexDescriptor = vertexDescriptor;
+
+    NSError* error = nil;
+    id<MTLRenderPipelineState> pipelineState = [device newRenderPipelineStateWithDescriptor:descriptor error:&error];
+    if (!pipelineState) {
+        NSLog(@"Failed to create UI pipeline state: %@", error);
+        return false;
+    }
+
+    metal_release_and_assign(&ctx->ui_pipeline, (__bridge_retained void*)pipelineState);
+    ctx->ui_vertex_stride = vertex_stride;
     return true;
 }
 
@@ -244,132 +319,161 @@ bool metal_draw(MetalContext* ctx, const float* clear_color) {
     id<MTLDevice> device = (__bridge id<MTLDevice>)ctx->device;
     if (!layer || !queue) return false;
 
-    // Get next drawable
     id<CAMetalDrawable> drawable = [layer nextDrawable];
     if (!drawable) return false;
 
-    // Create command buffer
     id<MTLCommandBuffer> commandBuffer = [queue commandBuffer];
     if (!commandBuffer) return false;
 
-    // Create render pass descriptor
-    MTLRenderPassDescriptor* passDescriptor = [MTLRenderPassDescriptor renderPassDescriptor];
-    passDescriptor.colorAttachments[0].texture = drawable.texture;
-    passDescriptor.colorAttachments[0].loadAction = MTLLoadActionClear;
-    passDescriptor.colorAttachments[0].storeAction = MTLStoreActionStore;
-
-    if (clear_color) {
-        passDescriptor.colorAttachments[0].clearColor = MTLClearColorMake(clear_color[0], clear_color[1], clear_color[2], clear_color[3]);
-    } else {
-        passDescriptor.colorAttachments[0].clearColor = MTLClearColorMake(0.1, 0.1, 0.1, 1.0);
-    }
-
-    MTLTextureDescriptor* depthDesc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatDepth32Float width:drawable.texture.width height:drawable.texture.height mipmapped:NO];
-    depthDesc.storageMode = MTLStorageModePrivate;
-    depthDesc.usage = MTLTextureUsageRenderTarget;
-    id<MTLTexture> depthTexture = [device newTextureWithDescriptor:depthDesc];
-    if (depthTexture) {
-        passDescriptor.depthAttachment.texture = depthTexture;
-        passDescriptor.depthAttachment.loadAction = MTLLoadActionClear;
-        passDescriptor.depthAttachment.storeAction = MTLStoreActionDontCare;
-        passDescriptor.depthAttachment.clearDepth = 1.0;
-    }
-
-    id<MTLRenderCommandEncoder> encoder = [commandBuffer renderCommandEncoderWithDescriptor:passDescriptor];
-    if (!encoder) return false;
-
-    id<MTLRenderPipelineState> pipeline = ctx->pipeline ? (__bridge id<MTLRenderPipelineState>)ctx->pipeline : nil;
+    id<MTLRenderPipelineState> geoPipeline = ctx->pipeline ? (__bridge id<MTLRenderPipelineState>)ctx->pipeline : nil;
+    id<MTLRenderPipelineState> uiPipeline = ctx->ui_pipeline ? (__bridge id<MTLRenderPipelineState>)ctx->ui_pipeline : nil;
     id<MTLBuffer> vertexBuffer = ctx->vertex_buffer ? (__bridge id<MTLBuffer>)ctx->vertex_buffer : nil;
     id<MTLBuffer> indexBuffer = ctx->index_buffer ? (__bridge id<MTLBuffer>)ctx->index_buffer : nil;
     id<MTLBuffer> uniformBuffer = ctx->uniform_buffer ? (__bridge id<MTLBuffer>)ctx->uniform_buffer : nil;
+    id<MTLBuffer> lineBuffer = ctx->line_buffer ? (__bridge id<MTLBuffer>)ctx->line_buffer : nil;
+    id<MTLBuffer> uiBuffer = ctx->ui_vertex_buffer ? (__bridge id<MTLBuffer>)ctx->ui_vertex_buffer : nil;
+    id<MTLDepthStencilState> depthState = ctx->depth_state ? (__bridge id<MTLDepthStencilState>)ctx->depth_state : nil;
 
-    if (pipeline && vertexBuffer && indexBuffer && ctx->index_count > 0) {
-        static int setup_count = 0;
-        if (setup_count < 3) {
-            NSLog(@"DEBUG Metal: Setting pipeline state - pipeline=%p, depthState=%p",
-                  (__bridge void*)pipeline, ctx->depth_state);
-            setup_count++;
-        }
-        [encoder setRenderPipelineState:pipeline];
-        if (ctx->depth_state) {
-            id<MTLDepthStencilState> depthState = (__bridge id<MTLDepthStencilState>)ctx->depth_state;
-            [encoder setDepthStencilState:depthState];
-        }
+    const bool has_geometry = geoPipeline && vertexBuffer && indexBuffer && ctx->index_count > 0;
+    const bool has_ui = uiPipeline && uiBuffer && ctx->ui_vertex_count > 0;
 
-        // Set viewport - CRITICAL for rendering!
-        MTLViewport viewport = {
-            .originX = 0,
-            .originY = 0,
-            .width = (double)drawable.texture.width,
-            .height = (double)drawable.texture.height,
-            .znear = 0.0,
-            .zfar = 1.0
-        };
-        [encoder setViewport:viewport];
+    MTLViewport viewport = {
+        .originX = 0,
+        .originY = 0,
+        .width = (double)drawable.texture.width,
+        .height = (double)drawable.texture.height,
+        .znear = 0.0,
+        .zfar = 1.0,
+    };
 
-        [encoder setFrontFacingWinding:MTLWindingCounterClockwise];
-        [encoder setCullMode:MTLCullModeNone]; // DEBUG: Disable backface culling
+    bool surface_cleared = false;
 
-        // Set triangle fill mode based on render mode
-        if (ctx->render_mode == RenderModeWireframe) {
-            [encoder setTriangleFillMode:MTLTriangleFillModeLines];
+    if (has_geometry) {
+        MTLRenderPassDescriptor* geoPass = [MTLRenderPassDescriptor renderPassDescriptor];
+        geoPass.colorAttachments[0].texture = drawable.texture;
+        geoPass.colorAttachments[0].loadAction = MTLLoadActionClear;
+        geoPass.colorAttachments[0].storeAction = MTLStoreActionStore;
+        if (clear_color) {
+            geoPass.colorAttachments[0].clearColor = MTLClearColorMake(clear_color[0], clear_color[1], clear_color[2], clear_color[3]);
         } else {
-            [encoder setTriangleFillMode:MTLTriangleFillModeFill];
+            geoPass.colorAttachments[0].clearColor = MTLClearColorMake(0.1, 0.1, 0.1, 1.0);
         }
 
-        [encoder setVertexBuffer:vertexBuffer offset:0 atIndex:0];
+        if (depthState) {
+            MTLTextureDescriptor* depthDesc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatDepth32Float width:drawable.texture.width height:drawable.texture.height mipmapped:NO];
+            depthDesc.storageMode = MTLStorageModePrivate;
+            depthDesc.usage = MTLTextureUsageRenderTarget;
+            id<MTLTexture> depthTexture = [device newTextureWithDescriptor:depthDesc];
+            if (depthTexture) {
+                geoPass.depthAttachment.texture = depthTexture;
+                geoPass.depthAttachment.loadAction = MTLLoadActionClear;
+                geoPass.depthAttachment.storeAction = MTLStoreActionDontCare;
+                geoPass.depthAttachment.clearDepth = 1.0;
+            }
+        }
+
+        id<MTLRenderCommandEncoder> geoEncoder = [commandBuffer renderCommandEncoderWithDescriptor:geoPass];
+        if (!geoEncoder) {
+            return false;
+        }
+
+        [geoEncoder setViewport:viewport];
+        [geoEncoder setRenderPipelineState:geoPipeline];
+        if (depthState) {
+            [geoEncoder setDepthStencilState:depthState];
+        }
+        [geoEncoder setFrontFacingWinding:MTLWindingCounterClockwise];
+        [geoEncoder setCullMode:MTLCullModeNone];
+        [geoEncoder setTriangleFillMode:ctx->render_mode == RenderModeWireframe ? MTLTriangleFillModeLines : MTLTriangleFillModeFill];
+        [geoEncoder setVertexBuffer:vertexBuffer offset:0 atIndex:0];
         if (uniformBuffer) {
-            [encoder setVertexBuffer:uniformBuffer offset:0 atIndex:1];
-            [encoder setFragmentBuffer:uniformBuffer offset:0 atIndex:0];
+            [geoEncoder setVertexBuffer:uniformBuffer offset:0 atIndex:1];
+            [geoEncoder setFragmentBuffer:uniformBuffer offset:0 atIndex:0];
         }
         if (ctx->texture) {
             id<MTLTexture> texture = (__bridge id<MTLTexture>)ctx->texture;
-            [encoder setFragmentTexture:texture atIndex:0];
+            [geoEncoder setFragmentTexture:texture atIndex:0];
         }
         if (ctx->sampler) {
             id<MTLSamplerState> sampler = (__bridge id<MTLSamplerState>)ctx->sampler;
-            [encoder setFragmentSamplerState:sampler atIndex:0];
+            [geoEncoder setFragmentSamplerState:sampler atIndex:0];
         }
-        // DEBUG: Log draw call
-        static int frame_count = 0;
-        if (frame_count < 3) {
-            NSLog(@"DEBUG Metal: Drawing %zu triangles, viewport=%.0fx%.0f",
-                  ctx->index_count / 3, viewport.width, viewport.height);
-            frame_count++;
-        }
+        [geoEncoder drawIndexedPrimitives:MTLPrimitiveTypeTriangle
+                              indexCount:(NSUInteger)ctx->index_count
+                               indexType:MTLIndexTypeUInt32
+                             indexBuffer:indexBuffer
+                       indexBufferOffset:0];
 
-        [encoder drawIndexedPrimitives:MTLPrimitiveTypeTriangle
-                            indexCount:(NSUInteger)ctx->index_count
-                             indexType:MTLIndexTypeUInt32
-                           indexBuffer:indexBuffer
-                     indexBufferOffset:0];
-
-        // Draw lines if line buffer is set
-        id<MTLBuffer> lineBuffer = ctx->line_buffer ? (__bridge id<MTLBuffer>)ctx->line_buffer : nil;
         if (lineBuffer && ctx->line_vertex_count > 0) {
-            [encoder setVertexBuffer:lineBuffer offset:0 atIndex:0];
+            [geoEncoder setVertexBuffer:lineBuffer offset:0 atIndex:0];
             if (uniformBuffer) {
-                [encoder setVertexBuffer:uniformBuffer offset:0 atIndex:1];
-                [encoder setFragmentBuffer:uniformBuffer offset:0 atIndex:0];
+                [geoEncoder setVertexBuffer:uniformBuffer offset:0 atIndex:1];
+                [geoEncoder setFragmentBuffer:uniformBuffer offset:0 atIndex:0];
             }
-            [encoder drawPrimitives:MTLPrimitiveTypeLine vertexStart:0 vertexCount:(NSUInteger)ctx->line_vertex_count];
+            [geoEncoder drawPrimitives:MTLPrimitiveTypeLine vertexStart:0 vertexCount:(NSUInteger)ctx->line_vertex_count];
         }
-    } else {
-        // DEBUG: Log why we're not drawing
-        static int skip_count = 0;
-        if (skip_count < 3) {
-            NSLog(@"DEBUG Metal: NOT drawing - pipeline=%p, vb=%p, ib=%p, count=%zu",
-                  (__bridge void*)pipeline, (__bridge void*)vertexBuffer, (__bridge void*)indexBuffer, ctx->index_count);
-            skip_count++;
+        [geoEncoder endEncoding];
+        surface_cleared = true;
+    }
+
+    if (has_ui) {
+        MTLRenderPassDescriptor* uiPass = [MTLRenderPassDescriptor renderPassDescriptor];
+        uiPass.colorAttachments[0].texture = drawable.texture;
+        if (surface_cleared) {
+            uiPass.colorAttachments[0].loadAction = MTLLoadActionLoad;
+        } else {
+            uiPass.colorAttachments[0].loadAction = MTLLoadActionClear;
+            if (clear_color) {
+                uiPass.colorAttachments[0].clearColor = MTLClearColorMake(clear_color[0], clear_color[1], clear_color[2], clear_color[3]);
+            } else {
+                uiPass.colorAttachments[0].clearColor = MTLClearColorMake(0.1, 0.1, 0.1, 1.0);
+            }
+            surface_cleared = true;
+        }
+        uiPass.colorAttachments[0].storeAction = MTLStoreActionStore;
+
+        id<MTLRenderCommandEncoder> uiEncoder = [commandBuffer renderCommandEncoderWithDescriptor:uiPass];
+        if (!uiEncoder) {
+            return false;
+        }
+
+        [uiEncoder setViewport:viewport];
+        [uiEncoder setRenderPipelineState:uiPipeline];
+        [uiEncoder setFrontFacingWinding:MTLWindingCounterClockwise];
+        [uiEncoder setCullMode:MTLCullModeNone];
+        [uiEncoder setTriangleFillMode:MTLTriangleFillModeFill];
+        [uiEncoder setVertexBuffer:nil offset:0 atIndex:1];
+        [uiEncoder setFragmentBuffer:nil offset:0 atIndex:0];
+        [uiEncoder setFragmentTexture:nil atIndex:0];
+        [uiEncoder setFragmentSamplerState:nil atIndex:0];
+        [uiEncoder setVertexBuffer:uiBuffer offset:0 atIndex:0];
+        [uiEncoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:(NSUInteger)ctx->ui_vertex_count];
+        [uiEncoder endEncoding];
+    } else if (!surface_cleared) {
+        MTLRenderPassDescriptor* clearPass = [MTLRenderPassDescriptor renderPassDescriptor];
+        clearPass.colorAttachments[0].texture = drawable.texture;
+        clearPass.colorAttachments[0].loadAction = MTLLoadActionClear;
+        clearPass.colorAttachments[0].storeAction = MTLStoreActionStore;
+        if (clear_color) {
+            clearPass.colorAttachments[0].clearColor = MTLClearColorMake(clear_color[0], clear_color[1], clear_color[2], clear_color[3]);
+        } else {
+            clearPass.colorAttachments[0].clearColor = MTLClearColorMake(0.1, 0.1, 0.1, 1.0);
+        }
+        id<MTLRenderCommandEncoder> clearEncoder = [commandBuffer renderCommandEncoderWithDescriptor:clearPass];
+        if (clearEncoder) {
+            [clearEncoder setViewport:viewport];
+            [clearEncoder endEncoding];
         }
     }
 
-    [encoder endEncoding];
     [commandBuffer presentDrawable:drawable];
     [commandBuffer commit];
 
     return true;
 }
+
+
+
 
 bool metal_render_frame(MetalContext* ctx, float r, float g, float b) {
     float clear[4] = { r, g, b, 1.0f };
@@ -429,6 +533,31 @@ bool metal_set_line_mesh(MetalContext* ctx, const void* vertices, size_t vertex_
     metal_release_and_assign(&ctx->line_buffer, (__bridge_retained void*)lineBuffer);
     ctx->line_vertex_count = vertex_count;
 
+    return true;
+}
+
+bool metal_set_ui_mesh(MetalContext* ctx, const void* vertices, size_t vertex_count, size_t vertex_stride) {
+    if (!ctx) return false;
+    if (!vertices || vertex_count == 0) {
+        if (ctx->ui_vertex_buffer) {
+            CFRelease(ctx->ui_vertex_buffer);
+            ctx->ui_vertex_buffer = NULL;
+        }
+        ctx->ui_vertex_count = 0;
+        ctx->ui_vertex_stride = 0;
+        return true;
+    }
+
+    id<MTLDevice> device = (__bridge id<MTLDevice>)ctx->device;
+    if (!device) return false;
+
+    NSUInteger length = (NSUInteger)(vertex_count * vertex_stride);
+    id<MTLBuffer> buffer = [device newBufferWithBytes:vertices length:length options:MTLResourceStorageModeShared];
+    if (!buffer) return false;
+
+    metal_release_and_assign(&ctx->ui_vertex_buffer, (__bridge_retained void*)buffer);
+    ctx->ui_vertex_stride = vertex_stride;
+    ctx->ui_vertex_count = vertex_count;
     return true;
 }
 

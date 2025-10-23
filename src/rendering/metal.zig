@@ -15,6 +15,14 @@ extern fn metal_create_pipeline(
     fragment_len: usize,
     vertex_stride: usize,
 ) bool;
+extern fn metal_create_ui_pipeline(
+    ctx: *anyopaque,
+    vertex_name: [*]const u8,
+    vertex_len: usize,
+    fragment_name: [*]const u8,
+    fragment_len: usize,
+    vertex_stride: usize,
+) bool;
 extern fn metal_set_mesh(
     ctx: *anyopaque,
     vertices: *const anyopaque,
@@ -26,6 +34,7 @@ extern fn metal_set_mesh(
 extern fn metal_set_uniforms(ctx: *anyopaque, uniforms: *const anyopaque, size: usize) bool;
 extern fn metal_draw(ctx: *anyopaque, clear_color: *const f32) bool;
 extern fn metal_set_line_mesh(ctx: *anyopaque, vertices: *const anyopaque, vertex_count: usize, vertex_stride: usize) bool;
+extern fn metal_set_ui_mesh(ctx: *anyopaque, vertices: *const anyopaque, vertex_count: usize, vertex_stride: usize) bool;
 extern fn metal_set_texture(ctx: *anyopaque, data: [*]const u8, width: usize, height: usize, bytes_per_row: usize) bool;
 extern fn metal_set_performance_hud(ctx: *anyopaque, enabled: bool) void;
 extern fn metal_set_render_mode(ctx: *anyopaque, mode: i32) void;
@@ -95,6 +104,24 @@ pub const MetalContext = struct {
         }
     }
 
+    pub fn createUIPipeline(
+        self: *MetalContext,
+        vertex_name: []const u8,
+        fragment_name: []const u8,
+        vertex_stride: usize,
+    ) !void {
+        if (!metal_create_ui_pipeline(
+            self.ctx,
+            vertex_name.ptr,
+            vertex_name.len,
+            fragment_name.ptr,
+            fragment_name.len,
+            vertex_stride,
+        )) {
+            return error.PipelineCreationFailed;
+        }
+    }
+
     pub fn setMesh(
         self: *MetalContext,
         vertex_data: []const u8,
@@ -142,6 +169,20 @@ pub const MetalContext = struct {
         const vertex_count = vertex_data.len / vertex_stride;
         if (!metal_set_line_mesh(self.ctx, vertex_data.ptr, vertex_count, vertex_stride)) {
             return error.LineMeshUploadFailed;
+        }
+    }
+
+    pub fn setUIMesh(self: *MetalContext, vertex_data: []const u8, vertex_stride: usize) !void {
+        if (vertex_data.len == 0) {
+            const dummy: u8 = 0;
+            _ = metal_set_ui_mesh(self.ctx, &dummy, 0, vertex_stride);
+            return;
+        }
+        if (vertex_stride == 0) return error.InvalidMeshData;
+        if (vertex_data.len % vertex_stride != 0) return error.InvalidMeshData;
+        const vertex_count = vertex_data.len / vertex_stride;
+        if (!metal_set_ui_mesh(self.ctx, vertex_data.ptr, vertex_count, vertex_stride)) {
+            return error.MeshUploadFailed;
         }
     }
 

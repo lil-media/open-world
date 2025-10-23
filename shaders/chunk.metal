@@ -76,6 +76,27 @@ fragment float4 fragment_main(
     return float4(finalColor, tex_color.a * in.color.a);
 }
 
+struct UIVertexIn {
+    float2 position [[attribute(0)]];
+    float4 color [[attribute(1)]];
+};
+
+struct UIVertexOut {
+    float4 position [[position]];
+    float4 color;
+};
+
+vertex UIVertexOut ui_vertex_main(UIVertexIn in [[stage_in]]) {
+    UIVertexOut out;
+    out.position = float4(in.position, 0.0, 1.0);
+    out.color = in.color;
+    return out;
+}
+
+fragment float4 ui_fragment_main(UIVertexOut in [[stage_in]]) {
+    return in.color;
+}
+
 // Simple shader for testing - just output a color
 fragment float4 fragment_simple(
     VertexOut in [[stage_in]]
