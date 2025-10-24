@@ -41,16 +41,21 @@ A high-performance voxel-based open world building game optimized for macOS and 
 - [x] Chunk persistence: RLE compression, packed region files with freelist reuse, and frame-safe autosave cadence
 - [x] Region compaction pass with backup swap + autosave interval/status feedback (HUD/console)
 - [x] World management UI (in-game menu + CLI list/select/create) with seed validation
+- [x] Difficulty presets drive view distance, autosave cadence, and chunk streaming budgets
+- [x] World management enhancements: rename/delete confirmations plus inline seed & description editing
+- [x] Rolling region backup controls (HUD telemetry + F11 maintenance queue)
+- [x] HUD notification stack with expanded LOD and backup telemetry overlays
+- [x] Four-tier LOD detail scheduler with averaged normals and vertical skirts to eliminate seams
 
 ### 🏗️ In Progress
-- [ ] Performance profiling and optimization
-- [ ] Chunk persistence polish (rolling region backups ✅; incremental backups & in-game save settings UI still pending)
-- [ ] HUD/UI polish for autosave status and save prompts
+- [ ] Performance profiling and optimization (streaming profiler HUD lines in place; next capture data and tune chunk budgets)
+- [ ] Chunk persistence polish (incremental autosave-triggered region backups, save settings UI, automated compaction cadence)
+- [ ] Test coverage for LOD scheduling and persistence workflows
 
 ### 📋 Next Up
 - [ ] Multi-block selection and copy/paste tools
-- [ ] Rolling region backups & compaction scheduling (background maintenance)
-- [ ] World management enhancements (rename/delete, metadata editing)
+- [ ] Automated backup scheduling & incremental save snapshots
+- [ ] World management UI polish (per-world settings, difficulty override history)
 - [ ] Environmental simulation design pass (weather, fluids, temperature)
 
 ## Phase Breakdown
@@ -85,12 +90,12 @@ A high-performance voxel-based open world building game optimized for macOS and 
   - [x] Frustum culling implementation (90% efficiency)
   - [x] Chunk mesh caching
   - [x] Dynamic lighting and sky colour pipeline
-  - [ ] Async mesh generation (background threading)
+  - [x] Async mesh generation (background threading)
   - [ ] GPU-driven indirect rendering
-  - [ ] 4-tier LOD system (0-64m, 64-128m, 128-256m, 256m+)
+  - [x] 4-tier LOD system (0-64m, 64-128m, 128-256m, 256m+)
 
 **Performance Target:** 60 FPS @ 1080p, 8-chunk render distance
-**Current Performance:** ✅ 114 FPS @ 1280x720 on M3 Pro (exceeds target!)
+**Current Performance:** ✅ 120 FPS @ 1280x720 on M3 Pro (difficulty-normal budgets, 160 loaded chunks)
 
 **Recent Optimizations (2025-10-21):**
 - **CRITICAL FIX:** Corrected Mat4 column-major multiplication in math.zig
@@ -112,15 +117,21 @@ A high-performance voxel-based open world building game optimized for macOS and 
 **Recent Optimizations (2025-10-22):**
 - Render budget gating: sort visible chunks by distance and cap uploads to ~96 chunks / 12M vertices (36M indices) per frame to keep Metal uploads under budget and stop 40M+ vertex spikes observed during profiling. GPU HUD remains <2 ms with CPU upload time stable under 6 ms even during aggressive streaming sweeps.
 - Budget-skipped chunk meshes now stay cached so returning to an area reuses existing buffers; only uploads occur when the frame budget has headroom.
+- Difficulty presets now drive view distance, autosave cadence, and per-frame chunk budgets; normal difficulty sustains 120 FPS at 1280x720 on M3 Pro even with 160 loaded chunks.
+- Four-tier LOD scheduler with detail hysteresis, averaged normals, and vertical skirts removes seam artifacts while keeping far terrain under budget.
+- Metal UI pass rewritten with a HUD notification stack (autosave, backups, difficulty events) and LOD/backup telemetry, eliminating the depth-stencil nil crash under API validation.
+- World management menu gains inline rename/delete confirmations, seed & description editing, and rolling backup controls (F11) with HUD feedback.
+- Streaming manager now records per-update timings/queue stats (surfaced on HUD) and autosave runs queue incremental region backups for the currently loaded regions.
 
 **Known Issues:**
-- Region backups are limited to single .bak swap; add rolling snapshots and integrity verification.
-- Autosave status currently logs to console/HUD text only; integrate with forthcoming UI overlay.
-- World management lacks rename/edit flows and seed editing; extend menu functionality beyond create/select/delete.
-- In-game Metal HUD and world selection overlay restored; monitor for regressions when adding future UI panels.
+- Autosave-triggered backups need throttling & integrity reporting; add scheduled compaction plus snapshot validation UI.
+- HUD notification stack is ephemeral; surface recent autosave/backup events in the world menu history.
+- World management menu needs a dedicated settings pane for autosave cadence, backup retention, and difficulty audit trail.
+- In-game Metal HUD and world selection overlay restored; monitor for regressions when layering additional panels.
   - ~~Async chunk cleanup segfault~~ - FIXED (2025-10-21)
   - ~~Thread.Pool CPU starvation~~ - RESOLVED (switched to dedicated worker thread)
-- Render budget still relies on full detail meshes; introduce far LOD or decimated buffers so the cache footprint stays reasonable as view distance grows.
+- Render path still CPU-submitted; GPU-driven indirect rendering and deeper decimation would unlock >160-chunk view distances without upload spikes.
+- Automated regression tests still missing for LOD scheduling, world management flows, and persistence upgrades.
 
 **Recent Fixes (2025-10-22):**
 - Restored missing MetalContext UI fields so the Objective-C bridge builds again after the partial UI revert.
@@ -130,6 +141,10 @@ A high-performance voxel-based open world building game optimized for macOS and 
 - Implemented autosave HUD overlay in-game (UI pipeline re-enabled once world meshes are present).
 - Added rolling region backups (default retention: 3 per region) with HUD/console status reporting.
 - World selection menu now surfaces per-world autosave cadence, backup retention, last-backup timestamp, and a one-key reset-to-defaults flow before loading a save (F5/F7/F8/F9).
+- Added inline rename UI (type-and-confirm) so saves can be retitled without leaving the menu.
+- Added inline seed editor with random reroll support, replacing the old console prompt.
+- Hardened world management editors with bounded buffers and explicit delete confirmations to avoid input stalls on macOS keyboards.
+- Added inline difficulty selector plus far-distance LOD batching (coarse top surfaces for distant chunks) to keep vertex counts under control.
 - Added local Zig global cache override (`zig-global-cache/`) to avoid permission failures during builds in restricted environments.
 - Re-ran `zig build render -Dskip-run=true` and `zig build test` (cache override) to validate the fix; interactive run still needs a local GPU/display.
 

@@ -288,7 +288,15 @@ pub const Frustum = struct {
         distance: f32,
 
         pub fn init(normal: Vec3, distance: f32) Plane {
-            return .{ .normal = normal.normalize(), .distance = distance };
+            const len = normal.length();
+            if (len == 0) {
+                return .{ .normal = normal, .distance = distance };
+            }
+            const inv_len = 1.0 / len;
+            return .{
+                .normal = normal.mul(inv_len),
+                .distance = distance * inv_len,
+            };
         }
 
         pub fn distanceToPoint(self: Plane, point: Vec3) f32 {

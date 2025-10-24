@@ -64,9 +64,6 @@ pub const SDLWindow = struct {
                     if (input_state) |state| {
                         state.handleKey(@as(u16, @intCast(event.key.keysym.scancode)), true);
                     }
-                    if (event.key.keysym.sym == c.SDLK_ESCAPE) {
-                        self.should_close = true;
-                    }
                 },
                 c.SDL_KEYUP => {
                     if (input_state) |state| {
@@ -109,6 +106,13 @@ pub const SDLWindow = struct {
                         self.height = @as(u32, @intCast(event.window.data2));
                     }
                 },
+                c.SDL_TEXTINPUT => {
+                    if (input_state) |state| {
+                        var text_len: usize = 0;
+                        while (text_len < event.text.text.len and event.text.text[text_len] != 0) : (text_len += 1) {}
+                        state.handleTextInput(event.text.text[0..text_len]);
+                    }
+                },
                 else => {},
             }
         }
@@ -122,5 +126,13 @@ pub const SDLWindow = struct {
 
     pub fn toggleCursorLock(self: *SDLWindow) void {
         self.setCursorLocked(!self.cursor_locked);
+    }
+
+    pub fn startTextInput(_: *SDLWindow) void {
+        c.SDL_StartTextInput();
+    }
+
+    pub fn stopTextInput(_: *SDLWindow) void {
+        c.SDL_StopTextInput();
     }
 };

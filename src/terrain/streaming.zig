@@ -96,6 +96,12 @@ pub const ChunkState = enum {
     unloading, // Being saved and removed
 };
 
+pub const ChunkDetail = enum {
+    full,
+    surfaceMedium,
+    surfaceFar,
+};
+
 const AutosaveReason = enum {
     timer,
     manual,
@@ -109,6 +115,29 @@ const AutosaveSummary = struct {
     reason: AutosaveReason,
 };
 
+pub const default_backup_schedule_interval_seconds: u32 = 10 * 60;
+
+const LoadMetrics = struct {
+    queued_candidates: u32 = 0,
+    queued_generations: u32 = 0,
+    completed_async: u32 = 0,
+    immediate_loaded: u32 = 0,
+    unloaded: u32 = 0,
+};
+
+const StreamingProfiling = struct {
+    last_update_ns: i128 = 0,
+    average_update_ns: f64 = 0,
+    max_update_ns: i128 = 0,
+    updates: u64 = 0,
+    queued_candidates: u32 = 0,
+    queued_generations: u32 = 0,
+    completed_async: u32 = 0,
+    immediate_loaded: u32 = 0,
+    unloaded: u32 = 0,
+    pending_generations: usize = 0,
+};
+
 /// Chunk streaming manager
 pub const ChunkStreamingManager = struct {
     allocator: std.mem.Allocator,
@@ -116,6 +145,8 @@ pub const ChunkStreamingManager = struct {
     // Loaded chunks (hash map: ChunkPos -> Chunk)
     chunks: std.AutoHashMap(u64, *terrain.Chunk),
     chunk_states: std.AutoHashMap(u64, ChunkState),
+    chunk_detail: std.AutoHashMap(u64, ChunkDetail),
+    chunk_desired_detail: std.AutoHashMap(u64, ChunkDetail),
 
     // Chunk pool for reuse
     chunk_pool: std.ArrayList(*terrain.Chunk),
@@ -145,6 +176,9 @@ pub const ChunkStreamingManager = struct {
     autosave_interval_seconds: u32,
     last_autosave_summary: ?AutosaveSummary,
     backup_retention: usize,
+    scheduled_backup_interval_ns: i128,
+    scheduled_backup_elapsed_ns: i128,
+    scheduled_backup_notice: bool,
 
     // Settings
     view_distance: i32, // In chunks
@@ -152,6 +186,9 @@ pub const ChunkStreamingManager = struct {
     max_chunks_per_frame: u32,
     allocated_chunks: usize,
     tracked_chunks: std.ArrayListUnmanaged(*terrain.Chunk),
+    profiling: StreamingProfiling,
+    backup_queue_cooldown_ns: i128,
+    last_backup_enqueue_ns: i128,
 
     pub fn init(allocator: std.mem.Allocator, seed: u64, view_distance: i32) !ChunkStreamingManager {
         // Use async by default with new dedicated thread approach
@@ -173,6 +210,8 @@ pub const ChunkStreamingManager = struct {
             .allocator = allocator,
             .chunks = std.AutoHashMap(u64, *terrain.Chunk).init(allocator),
             .chunk_states = std.AutoHashMap(u64, ChunkState).init(allocator),
+            .chunk_detail = std.AutoHashMap(u64, ChunkDetail).init(allocator),
+            .chunk_desired_detail = std.AutoHashMap(u64, ChunkDetail).init(allocator),
             .chunk_pool = ArrayListChunk{},
             .load_queue = std.PriorityQueue(ChunkRequest, void, ChunkRequest.lessThan).init(allocator, {}),
             .unload_queue = ArrayListChunkPos{},
@@ -190,11 +229,17 @@ pub const ChunkStreamingManager = struct {
             .autosave_interval_seconds = 30,
             .last_autosave_summary = null,
             .backup_retention = persistence.default_region_backup_retention,
+            .scheduled_backup_interval_ns = 0,
+            .scheduled_backup_elapsed_ns = 0,
+            .scheduled_backup_notice = false,
             .view_distance = view_distance,
             .unload_distance = view_distance + 2, // Hysteresis
             .max_chunks_per_frame = 4,
             .allocated_chunks = 0,
             .tracked_chunks = .{},
+            .profiling = .{},
+            .backup_queue_cooldown_ns = 60 * @as(i128, std.time.ns_per_s),
+            .last_backup_enqueue_ns = 0,
         };
 
         // Don't start the thread yet - it will be started after the manager is in its final location
@@ -238,6 +283,8 @@ pub const ChunkStreamingManager = struct {
         self.unloadAll();
         self.chunks.deinit();
         self.chunk_states.deinit();
+        self.chunk_detail.deinit();
+        self.chunk_desired_detail.deinit();
         self.chunk_pool.deinit(self.allocator);
         self.load_queue.deinit();
         self.unload_queue.deinit(self.allocator);
@@ -261,6 +308,8 @@ pub const ChunkStreamingManager = struct {
 
         self.chunks.clearRetainingCapacity();
         self.chunk_states.clearRetainingCapacity();
+        self.chunk_detail.clearRetainingCapacity();
+        self.chunk_desired_detail.clearRetainingCapacity();
         self.chunk_pool.clearRetainingCapacity();
 
         while (self.load_queue.removeOrNull()) |_| {}
@@ -275,27 +324,68 @@ pub const ChunkStreamingManager = struct {
 
     /// Update chunk loading based on player position
     pub fn update(self: *ChunkStreamingManager, player_pos: math.Vec3, player_forward: math.Vec3) !void {
+        const update_start = std.time.nanoTimestamp();
         const player_chunk = ChunkPos.fromWorldPos(
             @intFromFloat(@floor(player_pos.x)),
             @intFromFloat(@floor(player_pos.z)),
         );
 
+        var metrics = LoadMetrics{};
+
         // Determine which chunks should be loaded
         try self.updateLoadQueue(player_chunk, player_forward);
+        metrics.queued_candidates = @intCast(self.load_queue.items.len);
 
         // Determine which chunks should be unloaded
         try self.updateUnloadQueue(player_chunk);
 
         // Process loading (limit per frame)
-        try self.processLoading();
+        try self.processLoading(&metrics);
 
         // Process unloading
-        try self.processUnloading();
+        metrics.unloaded = try self.processUnloading();
 
         self.autosaveIfDue();
         if (self.world_persistence) |wp| {
             wp.serviceMaintenance(1);
         }
+
+        const update_end = std.time.nanoTimestamp();
+        const delta_ns = update_end - update_start;
+        if (self.scheduled_backup_interval_ns > 0) {
+            self.scheduled_backup_elapsed_ns += delta_ns;
+            if (self.scheduled_backup_elapsed_ns >= self.scheduled_backup_interval_ns) {
+                if (self.queueLoadedRegionBackups()) {
+                    self.scheduled_backup_elapsed_ns = 0;
+                } else {
+                    const retry_ns = 30 * @as(i128, std.time.ns_per_s);
+                    const backoff = if (self.scheduled_backup_interval_ns > retry_ns)
+                        self.scheduled_backup_interval_ns - retry_ns
+                    else
+                        @divTrunc(self.scheduled_backup_interval_ns, @as(i128, 2));
+                    self.scheduled_backup_elapsed_ns = @max(backoff, @as(i128, 0));
+                }
+            }
+        }
+
+        var stats = &self.profiling;
+        stats.last_update_ns = delta_ns;
+        stats.updates += 1;
+        const delta_f64 = @as(f64, @floatFromInt(delta_ns));
+        if (stats.updates == 1) {
+            stats.average_update_ns = delta_f64;
+            stats.max_update_ns = delta_ns;
+        } else {
+            const updates_f64 = @as(f64, @floatFromInt(stats.updates));
+            stats.average_update_ns += (delta_f64 - stats.average_update_ns) / updates_f64;
+            if (delta_ns > stats.max_update_ns) stats.max_update_ns = delta_ns;
+        }
+        stats.pending_generations = self.pending_chunks.count();
+        stats.queued_candidates = metrics.queued_candidates;
+        stats.queued_generations = metrics.queued_generations;
+        stats.completed_async = metrics.completed_async;
+        stats.immediate_loaded = metrics.immediate_loaded;
+        stats.unloaded = metrics.unloaded;
 
         if (std.debug.runtime_safety and !self.use_async) {
             // Account for chunks in all states: loaded, pooled, and pending (async)
@@ -366,7 +456,7 @@ pub const ChunkStreamingManager = struct {
         }
     }
 
-    fn processLoading(self: *ChunkStreamingManager) !void {
+    fn processLoading(self: *ChunkStreamingManager, metrics: *LoadMetrics) !void {
         // First, collect completed async chunks (non-blocking)
         if (self.use_async) {
             self.generation_mutex.lock();
@@ -380,6 +470,7 @@ pub const ChunkStreamingManager = struct {
                     const chunk = entry.value;
                     try self.chunks.put(hash_val, chunk);
                     try self.chunk_states.put(hash_val, .ready);
+                    metrics.completed_async += 1;
                 }
             }
         }
@@ -392,8 +483,10 @@ pub const ChunkStreamingManager = struct {
             if (self.use_async) {
                 // Queue for background generation instead of generating synchronously
                 try self.queueChunkGeneration(request.pos);
+                metrics.queued_generations += 1;
             } else {
                 try self.loadChunk(request.pos);
+                metrics.immediate_loaded += 1;
             }
 
             loaded += 1;
@@ -466,11 +559,14 @@ pub const ChunkStreamingManager = struct {
         }
     }
 
-    fn processUnloading(self: *ChunkStreamingManager) !void {
+    fn processUnloading(self: *ChunkStreamingManager) !u32 {
+        var unloaded: u32 = 0;
         for (self.unload_queue.items) |chunk_pos| {
             try self.unloadChunk(chunk_pos);
+            unloaded += 1;
         }
         self.unload_queue.clearRetainingCapacity();
+        return unloaded;
     }
 
     fn loadChunk(self: *ChunkStreamingManager, pos: ChunkPos) !void {
@@ -534,6 +630,8 @@ pub const ChunkStreamingManager = struct {
         }
 
         _ = self.chunk_states.remove(hash_val);
+        _ = self.chunk_detail.remove(hash_val);
+        _ = self.chunk_desired_detail.remove(hash_val);
     }
 
     pub fn resetAutosaveTimer(self: *ChunkStreamingManager) void {
@@ -580,6 +678,9 @@ pub const ChunkStreamingManager = struct {
                 self.autosave_interval_ns = seconds_i128 * @as(i128, std.time.ns_per_s);
             }
             self.backup_retention = wp.regionBackupRetention();
+            self.scheduled_backup_interval_ns = @as(i128, @intCast(default_backup_schedule_interval_seconds)) * @as(i128, std.time.ns_per_s);
+            self.scheduled_backup_elapsed_ns = 0;
+            self.scheduled_backup_notice = false;
         }
     }
 
@@ -633,6 +734,10 @@ pub const ChunkStreamingManager = struct {
         }
 
         if (saved == 0 and errors == 0) return null;
+
+        if (saved > 0) {
+            _ = self.queueLoadedRegionBackups();
+        }
 
         const end = std.time.nanoTimestamp();
         return AutosaveSummary{
@@ -707,6 +812,68 @@ pub const ChunkStreamingManager = struct {
         return self.chunk_states.get(hash_val) orelse .unloaded;
     }
 
+    pub fn getChunkDetail(self: *ChunkStreamingManager, pos: ChunkPos) ?ChunkDetail {
+        return self.chunk_detail.get(pos.hash());
+    }
+
+    pub fn setChunkDetail(self: *ChunkStreamingManager, pos: ChunkPos, detail: ChunkDetail) void {
+        self.chunk_detail.put(pos.hash(), detail) catch {};
+    }
+
+    pub fn getDesiredDetail(self: *ChunkStreamingManager, pos: ChunkPos) ?ChunkDetail {
+        return self.chunk_desired_detail.get(pos.hash());
+    }
+
+    pub fn setDesiredDetail(self: *ChunkStreamingManager, pos: ChunkPos, detail: ChunkDetail) void {
+        self.chunk_desired_detail.put(pos.hash(), detail) catch {};
+    }
+
+    pub fn profilingStats(self: *const ChunkStreamingManager) StreamingProfiling {
+        return self.profiling;
+    }
+
+    pub fn queueLoadedRegionBackups(self: *ChunkStreamingManager) bool {
+        if (self.world_persistence) |wp| {
+            const now = std.time.nanoTimestamp();
+            if (self.backup_queue_cooldown_ns > 0 and self.last_backup_enqueue_ns != 0) {
+                if (now - self.last_backup_enqueue_ns < self.backup_queue_cooldown_ns) {
+                    return false;
+                }
+            }
+
+            var queued = false;
+            var it = self.chunks.iterator();
+            while (it.next()) |entry| {
+                const chunk = entry.value_ptr.*;
+                wp.queueRegionCompactionRequest(chunk.x, chunk.z);
+                queued = true;
+            }
+
+            if (queued) {
+                self.last_backup_enqueue_ns = now;
+                self.scheduled_backup_elapsed_ns = 0;
+                self.scheduled_backup_notice = true;
+            }
+            return queued;
+        }
+        return false;
+    }
+
+    pub fn backupCooldownSecondsRemaining(self: *const ChunkStreamingManager) i64 {
+        if (self.backup_queue_cooldown_ns == 0 or self.last_backup_enqueue_ns == 0) return 0;
+        const now = std.time.nanoTimestamp();
+        const elapsed: i128 = now - self.last_backup_enqueue_ns;
+        if (elapsed >= self.backup_queue_cooldown_ns) return 0;
+        const remaining = self.backup_queue_cooldown_ns - elapsed;
+        return @intCast(@divTrunc(remaining, @as(i128, std.time.ns_per_s)));
+    }
+
+    pub fn takeScheduledBackupNotice(self: *ChunkStreamingManager) bool {
+        const notice = self.scheduled_backup_notice;
+        self.scheduled_backup_notice = false;
+        return notice;
+    }
+
     /// Get number of loaded chunks
     pub fn getLoadedCount(self: *ChunkStreamingManager) u32 {
         return @intCast(self.chunks.count());
@@ -777,4 +944,51 @@ test "chunk streaming manager" {
 
     // Should have loaded some chunks
     try std.testing.expect(manager.getLoadedCount() > 0);
+}
+
+test "scheduled maintenance enqueues region backups after interval" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const temp_root = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(temp_root);
+
+    const worlds_root = try std.fs.path.join(allocator, &.{ temp_root, "worlds" });
+    defer allocator.free(worlds_root);
+    try std.fs.cwd().makePath(worlds_root);
+
+    var world = try persistence.WorldPersistence.init(allocator, "sched_test", .{
+        .worlds_root = worlds_root,
+        .force_new = true,
+    });
+    defer world.deinit();
+
+    var manager = try ChunkStreamingManager.initWithAsync(allocator, world.seed(), 2, false);
+    defer manager.deinit();
+    manager.world_persistence = &world;
+    manager.syncPersistenceSettings();
+    manager.max_chunks_per_frame = 9;
+
+    // Warm up enough chunks so maintenance has work to queue.
+    try manager.update(math.Vec3.init(0, 70, 0), math.Vec3.init(0, 0, -1));
+
+    manager.scheduled_backup_interval_ns = 1 * @as(i128, std.time.ns_per_s);
+    manager.scheduled_backup_elapsed_ns = manager.scheduled_backup_interval_ns;
+    manager.scheduled_backup_notice = false;
+    manager.backup_queue_cooldown_ns = 5 * @as(i128, std.time.ns_per_s);
+    manager.last_backup_enqueue_ns = 0;
+
+    try manager.update(math.Vec3.init(0, 70, 0), math.Vec3.init(0, 0, -1));
+
+    try std.testing.expect(manager.takeScheduledBackupNotice());
+    try std.testing.expect(!manager.takeScheduledBackupNotice());
+
+    const metrics = world.getMaintenanceMetrics();
+    try std.testing.expect(metrics.queued_regions > 0);
+    try std.testing.expect(manager.backupCooldownSecondsRemaining() >= 0);
+    try std.testing.expect(manager.scheduled_backup_elapsed_ns == 0);
 }

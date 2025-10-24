@@ -201,6 +201,150 @@ pub const GreedyMesher = struct {
         return mesh;
     }
 
+    /// Generate a simplified mesh by sampling the surface in coarse cells.
+    pub fn generateSurfaceMesh(self: *GreedyMesher, chunk: *const terrain.Chunk, cell_size: usize, emit_skirts: bool) !ChunkMesh {
+        var mesh = ChunkMesh.init(self.allocator);
+
+        const size = terrain.Chunk.CHUNK_SIZE;
+        const height = terrain.Chunk.CHUNK_HEIGHT;
+        const ao: [4]f32 = .{ 1.0, 1.0, 1.0, 1.0 };
+
+        const sampler = struct {
+            pub fn highest(chunk_ref: *const terrain.Chunk, xs: usize, xe: usize, zs: usize, ze: usize) i32 {
+                var hi: i32 = -1;
+                var xi = xs;
+                while (xi < xe) : (xi += 1) {
+                    var zi = zs;
+                    while (zi < ze) : (zi += 1) {
+                        var y: i32 = @as(i32, @intCast(height)) - 1;
+                        while (y >= 0) : (y -= 1) {
+                            if (chunk_ref.blocks[xi][zi][@intCast(y)].block_type != .air) {
+                                if (y > hi) hi = y;
+                                break;
+                            }
+                        }
+                    }
+                }
+                return hi;
+            }
+        };
+
+        var x: usize = 0;
+        while (x < size) : (x += cell_size) {
+            const x_max = @min(x + cell_size, size);
+            var z: usize = 0;
+            while (z < size) : (z += cell_size) {
+                const z_max = @min(z + cell_size, size);
+
+                var highest: i32 = -1;
+                var lowest: i32 = terrain.Chunk.CHUNK_HEIGHT;
+                var top_block: terrain.BlockType = .air;
+
+                var xi = x;
+                while (xi < x_max) : (xi += 1) {
+                    var zi = z;
+                    while (zi < z_max) : (zi += 1) {
+                        var y: i32 = @as(i32, @intCast(height)) - 1;
+                        while (y >= 0) : (y -= 1) {
+                            const block = chunk.blocks[xi][zi][@intCast(y)];
+                            if (block.block_type != .air) {
+                                if (y > highest) {
+                                    highest = y;
+                                    top_block = block.block_type;
+                                }
+                                if (y < lowest) {
+                                    lowest = y;
+                                }
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                if (highest < 0) continue;
+                if (lowest == terrain.Chunk.CHUNK_HEIGHT) lowest = highest;
+
+                const local_x = @as(f32, @floatFromInt(x));
+                const local_z = @as(f32, @floatFromInt(z));
+                const quad_width = @as(f32, @floatFromInt(x_max - x));
+                const quad_depth = @as(f32, @floatFromInt(z_max - z));
+                const top_y = @as(f32, @floatFromInt(highest));
+                const top_surface = @as(f32, @floatFromInt(highest + 1));
+                const bottom_y = @as(f32, @floatFromInt(@max(lowest, 0)));
+
+                const sample_clamp = struct {
+                    pub fn value(v: i32) f32 {
+                        if (v < 0) return 0.0;
+                        return @as(f32, @floatFromInt(v + 1));
+                    }
+                };
+
+                const north_highest = if (z == 0)
+                    highest
+                else
+                    sampler.highest(chunk, x, x_max, z - @min(z, cell_size), z);
+                const south_highest = if (z_max >= size)
+                    highest
+                else
+                    sampler.highest(chunk, x, x_max, z_max, @min(size, z_max + cell_size));
+                const west_highest = if (x == 0)
+                    highest
+                else
+                    sampler.highest(chunk, x - @min(x, cell_size), x, z, z_max);
+                const east_highest = if (x_max >= size)
+                    highest
+                else
+                    sampler.highest(chunk, x_max, @min(size, x_max + cell_size), z, z_max);
+
+                const north_top = sample_clamp.value(north_highest);
+                const south_top = sample_clamp.value(south_highest);
+                const west_top = sample_clamp.value(west_highest);
+                const east_top = sample_clamp.value(east_highest);
+
+                const slope = math.Vec3.init(-(east_top - west_top), 2.0, -(south_top - north_top));
+                const top_normal_vec = if (slope.lengthSquared() > 0.0001)
+                    slope.normalize()
+                else
+                    math.Vec3.init(0.0, 1.0, 0.0);
+                const top_normal = [3]f32{ top_normal_vec.x, top_normal_vec.y, top_normal_vec.z };
+
+                try mesh.addQuad(local_x, top_y, local_z, quad_width, quad_depth, .top, ao, top_block);
+                const base_index = mesh.vertices.items.len - 4;
+                mesh.vertices.items[base_index + 0].normal = top_normal;
+                mesh.vertices.items[base_index + 1].normal = top_normal;
+                mesh.vertices.items[base_index + 2].normal = top_normal;
+                mesh.vertices.items[base_index + 3].normal = top_normal;
+
+                if (emit_skirts) {
+                    const underside_y = bottom_y - 0.05;
+                    try mesh.addQuad(local_x, underside_y, local_z, quad_width, quad_depth, .bottom, ao, top_block);
+
+                    const north_height = top_surface - north_top;
+                    if (north_height > 0.01) {
+                        try mesh.addQuad(local_x, north_top, local_z, quad_width, north_height, .north, ao, top_block);
+                    }
+
+                    const south_height = top_surface - south_top;
+                    if (south_height > 0.01) {
+                        try mesh.addQuad(local_x, south_top, local_z + quad_depth - 1.0, quad_width, south_height, .south, ao, top_block);
+                    }
+
+                    const west_height = top_surface - west_top;
+                    if (west_height > 0.01) {
+                        try mesh.addQuad(local_x, west_top, local_z, quad_depth, west_height, .west, ao, top_block);
+                    }
+
+                    const east_height = top_surface - east_top;
+                    if (east_height > 0.01) {
+                        try mesh.addQuad(local_x + quad_width - 1.0, east_top, local_z, quad_depth, east_height, .east, ao, top_block);
+                    }
+                }
+            }
+        }
+
+        return mesh;
+    }
+
     fn meshAxis(self: *GreedyMesher, chunk: *const terrain.Chunk, mesh: *ChunkMesh, axis: usize) !void {
         const chunk_size = terrain.Chunk.CHUNK_SIZE;
         const chunk_height = terrain.Chunk.CHUNK_HEIGHT;
@@ -320,7 +464,6 @@ pub const GreedyMesher = struct {
                         // Determine face direction based on which side we're processing
                         const face_dir = getFaceDirection(axis, is_positive_direction);
                         const face_block_type = block_type;
-
 
                         // Calculate ambient occlusion (simplified - all 1.0 for now)
                         const ao = [4]f32{ 1.0, 1.0, 1.0, 1.0 };

@@ -17,8 +17,97 @@ const raycast = @import("utils/raycast.zig");
 const line_text = @import("ui/line_text.zig");
 
 const default_world_name = "default_world";
+const max_world_name_len: usize = 48;
+const seed_digits_max: usize = 20; // enough for u64
+const max_description_len: usize = 256;
+const RenameWorldError = error{
+    NameEmpty,
+    NameUnchanged,
+    AlreadyExists,
+    PersistenceFailure,
+};
+const difficulty_cycle = [_]persistence.Difficulty{ .peaceful, .easy, .normal, .hard };
 const autosave_default_presets = [_]u32{ 0, 15, 30, 60, 120 };
 const backup_default_presets = [_]usize{ 1, 2, 3, 5, 8, 12, 16 };
+
+pub const TestScenario = enum {
+    none,
+    lod_sweep,
+};
+
+const ParseScenarioError = error{InvalidScenario};
+
+const HudNotification = struct {
+    text: [128]u8,
+    len: usize,
+    timer: f32,
+};
+
+fn pushHudNotification(list: *std.ArrayListUnmanaged(HudNotification), allocator: std.mem.Allocator, message: []const u8, duration: f32) void {
+    var notif = HudNotification{
+        .text = [_]u8{0} ** 128,
+        .len = 0,
+        .timer = duration,
+    };
+    const copy_len = @min(message.len, notif.text.len);
+    std.mem.copyForwards(u8, notif.text[0..copy_len], message[0..copy_len]);
+    notif.len = copy_len;
+    if (list.items.len >= 4) {
+        _ = list.orderedRemove(0);
+    }
+    list.append(allocator, notif) catch {};
+}
+
+fn updateHudNotifications(list: *std.ArrayListUnmanaged(HudNotification), delta: f32) void {
+    var i: usize = 0;
+    while (i < list.items.len) {
+        if (list.items[i].timer > delta) {
+            list.items[i].timer -= delta;
+            i += 1;
+        } else {
+            _ = list.orderedRemove(i);
+        }
+    }
+}
+
+fn difficultyLabelShort(diff: persistence.Difficulty) []const u8 {
+    return persistence.difficultyLabel(diff);
+}
+
+fn cycleDifficulty(current: persistence.Difficulty, delta: i32) persistence.Difficulty {
+    var idx: usize = 0;
+    while (idx < difficulty_cycle.len and difficulty_cycle[idx] != current) : (idx += 1) {}
+    const len_i32: i32 = @intCast(difficulty_cycle.len);
+    const new_index = @mod(@as(i32, @intCast(idx)) + delta + len_i32, len_i32);
+    return difficulty_cycle[@intCast(new_index)];
+}
+
+fn viewDistanceForDifficulty(diff: persistence.Difficulty) i32 {
+    return switch (diff) {
+        .peaceful => 6,
+        .easy => 8,
+        .normal => 10,
+        .hard => 12,
+    };
+}
+
+fn autosaveIntervalForDifficulty(diff: persistence.Difficulty) u32 {
+    return switch (diff) {
+        .peaceful => 120,
+        .easy => 60,
+        .normal => 30,
+        .hard => 15,
+    };
+}
+
+fn chunkBudgetForDifficulty(diff: persistence.Difficulty) u32 {
+    return switch (diff) {
+        .peaceful => 6,
+        .easy => 5,
+        .normal => 4,
+        .hard => 3,
+    };
+}
 
 pub const DemoOptions = struct {
     max_frames: ?u32 = null,
@@ -26,12 +115,20 @@ pub const DemoOptions = struct {
     world_seed: ?u64 = null,
     force_new_world: bool = false,
     worlds_root: []const u8 = persistence.default_worlds_root,
+    world_difficulty: ?persistence.Difficulty = null,
+    world_description: ?[]const u8 = null,
+    scenario: TestScenario = .none,
+    scenario_output: ?[]const u8 = null,
+    scenario_settle_frames: u32 = 120,
+    profile_log: ?[]const u8 = null,
+    profile_frames: u32 = 600,
 };
 
 const WorldSelectionResult = struct {
     name: []u8,
     seed: ?u64,
     force_new: bool,
+    difficulty: persistence.Difficulty,
 };
 
 fn generateRandomSeed() u64 {
@@ -40,6 +137,182 @@ fn generateRandomSeed() u64 {
     const base_seed: u64 = @truncate(abs_ns);
     var prng = std.Random.DefaultPrng.init(base_seed ^ 0x9E3779B97F4A7C15);
     return prng.random().int(u64);
+}
+
+pub fn parseScenario(value: []const u8) ParseScenarioError!TestScenario {
+    if (std.ascii.eqlIgnoreCase(value, "lod-sweep")) return .lod_sweep;
+    if (std.ascii.eqlIgnoreCase(value, "lod_sweep")) return .lod_sweep;
+    return error.InvalidScenario;
+}
+
+fn runScenarioLodSweep(
+    allocator: std.mem.Allocator,
+    options: DemoOptions,
+    metal_ctx: *metal.MetalContext,
+    chunk_manager: *streaming.ChunkStreamingManager,
+    player_physics: *player.PlayerPhysics,
+    main_camera: *camera.Camera,
+    model_matrix: math.Mat4,
+    mesher: *mesh.GreedyMesher,
+    mesh_cache: *std.AutoHashMap(u64, CachedMesh),
+    combined_vertices: *std.ArrayListUnmanaged(metal_renderer.Vertex),
+    combined_indices: *std.ArrayListUnmanaged(u32),
+) !void {
+    const default_dir = "screenshots";
+    const base_dir = options.scenario_output orelse default_dir;
+    try std.fs.cwd().makePath(base_dir);
+    const sep = std.fs.path.sep_str;
+    const scenario_dir = try std.fmt.allocPrint(allocator, "{s}{s}{s}", .{ base_dir, sep, "lod_sweep" });
+    defer allocator.free(scenario_dir);
+    try std.fs.cwd().makePath(scenario_dir);
+
+    std.debug.print("Running LOD sweep scenario -> {s}\n", .{scenario_dir});
+
+    const Shot = struct {
+        name: []const u8,
+        offset: math.Vec3,
+        look_offset: math.Vec3,
+    };
+
+    const shots = [_]Shot{
+        .{ .name = "far_front", .offset = math.Vec3.init(0, 60, -160), .look_offset = math.Vec3.zero() },
+        .{ .name = "mid_front", .offset = math.Vec3.init(0, 30, -80), .look_offset = math.Vec3.zero() },
+        .{ .name = "east_high", .offset = math.Vec3.init(140, 60, 0), .look_offset = math.Vec3.zero() },
+        .{ .name = "near_ground", .offset = math.Vec3.init(0, 6, -16), .look_offset = math.Vec3.zero() },
+        .{ .name = "below", .offset = math.Vec3.init(0, -8, -10), .look_offset = math.Vec3.init(0, 6, 0) },
+    };
+
+    const settle_frames = @max(@as(usize, @intCast(options.scenario_settle_frames)), @as(usize, 1));
+    const anchor = math.Vec3.init(8.0, 75.0, 8.0);
+
+    const original_budget = chunk_manager.max_chunks_per_frame;
+    const span_side: i32 = chunk_manager.view_distance * 2 + 1;
+    const view_span: u32 = @as(u32, @intCast(span_side * span_side));
+    chunk_manager.max_chunks_per_frame = @max(original_budget, view_span);
+    defer chunk_manager.max_chunks_per_frame = original_budget;
+
+    player_physics.is_flying = true;
+
+    for (shots, 0..) |shot, idx| {
+        const shot_position = anchor.add(shot.offset);
+        player_physics.teleport(shot_position);
+        main_camera.setPosition(player_physics.getEyePosition());
+        main_camera.setMode(.free_cam);
+
+        var dir = anchor.add(shot.look_offset).sub(main_camera.getPosition());
+        if (dir.lengthSquared() > 0.0001) {
+            dir = dir.normalize();
+            const yaw = std.math.atan2(dir.z, dir.x);
+            const pitch = std.math.asin(dir.y);
+            main_camera.setRotation(yaw, pitch);
+        } else {
+            main_camera.updateVectors();
+        }
+
+        var settle: usize = 0;
+        while (settle < settle_frames) : (settle += 1) {
+            try chunk_manager.update(player_physics.position, main_camera.front);
+            std.Thread.sleep(std.time.ns_per_ms);
+        }
+
+        var attempts: usize = 0;
+        var mesh_stats = try updateGpuMeshes(allocator, chunk_manager, mesh_cache, mesher, combined_vertices, combined_indices, main_camera.getFrustum(), main_camera.getPosition(), default_meshes_per_frame);
+        var mesh_changed = mesh_stats.changed;
+        while (mesh_stats.changed and attempts < 3) : (attempts += 1) {
+            std.Thread.sleep(std.time.ns_per_ms);
+            mesh_stats = try updateGpuMeshes(allocator, chunk_manager, mesh_cache, mesher, combined_vertices, combined_indices, main_camera.getFrustum(), main_camera.getPosition(), default_meshes_per_frame);
+            mesh_changed = mesh_changed or mesh_stats.changed;
+        }
+
+        const has_mesh = combined_vertices.items.len > 0 and combined_indices.items.len > 0;
+        if (mesh_changed and has_mesh) {
+            try metal_ctx.setMesh(std.mem.sliceAsBytes(combined_vertices.items), @sizeOf(metal_renderer.Vertex), combined_indices.items);
+        }
+
+        try metal_ctx.setLineMesh(&[_]u8{}, @sizeOf(metal_renderer.Vertex));
+        try metal_ctx.setUIMesh(&[_]u8{}, @sizeOf(line_text.UIVertex));
+
+        const shot_file = try std.fmt.allocPrint(allocator, "{s}-{d:02}.png", .{ shot.name, idx + 1 });
+        defer allocator.free(shot_file);
+        const shot_path = try std.fmt.allocPrint(allocator, "{s}{s}{s}", .{ scenario_dir, sep, shot_file });
+        defer allocator.free(shot_path);
+
+        try metal_ctx.requestCapture(shot_path);
+
+        const view = main_camera.getViewMatrix();
+        const projection = main_camera.getProjectionMatrix();
+        const camera_pos = main_camera.getPosition();
+
+        const time_of_day: f32 = 0.55;
+        const sun_theta = (time_of_day * std.math.tau) - (std.math.pi / 2.0);
+        const sun_dir_vec = math.Vec3.init(@cos(sun_theta), @sin(sun_theta), 0.25).normalize();
+        const sun_elevation = sun_dir_vec.y;
+        const base_day_factor = std.math.clamp((sun_elevation + 0.05) / 1.05, 0.0, 1.0);
+        const day_factor = math.clamp(base_day_factor, 0.85, 1.0);
+        const sun_intensity = lerp(1.0, 1.3, day_factor);
+        const sun_color_vec = math.Vec3.init(
+            lerp(0.9, 1.05, day_factor),
+            lerp(0.55, 1.05, day_factor),
+            lerp(0.4, 1.0, day_factor),
+        ).mul(sun_intensity);
+        const ambient_strength = lerp(0.2, 0.55, day_factor);
+        const ambient_color_vec = math.Vec3.init(ambient_strength, ambient_strength, ambient_strength);
+        const sky_color_day = math.Vec3.init(0.6, 0.78, 1.0);
+        const sky_color_night = math.Vec3.init(0.02, 0.02, 0.05);
+        const sky_color_vec = math.Vec3.init(
+            lerp(sky_color_night.x, sky_color_day.x, day_factor),
+            lerp(sky_color_night.y, sky_color_day.y, day_factor),
+            lerp(sky_color_night.z, sky_color_day.z, day_factor),
+        );
+
+        if (has_mesh) {
+            const vp = projection.multiply(view);
+            const mvp = vp.multiply(model_matrix);
+            const fog_start: f32 = 40.0;
+            const fog_range: f32 = 80.0;
+
+            var uniforms = metal_renderer.Uniforms{
+                .model_view_projection = mvp.data,
+                .model = model_matrix.data,
+                .view = view.data,
+                .projection = projection.data,
+                .sun_direction = [4]f32{ sun_dir_vec.x, sun_dir_vec.y, sun_dir_vec.z, 0.0 },
+                .sun_color = [4]f32{ sun_color_vec.x, sun_color_vec.y, sun_color_vec.z, 1.0 },
+                .ambient_color = [4]f32{ ambient_color_vec.x, ambient_color_vec.y, ambient_color_vec.z, 1.0 },
+                .sky_color = [4]f32{ sky_color_vec.x, sky_color_vec.y, sky_color_vec.z, 1.0 },
+                .camera_position = [4]f32{ camera_pos.x, camera_pos.y, camera_pos.z, 1.0 },
+                .fog_params = [4]f32{ 0.0, fog_start, fog_range, 0.0 },
+            };
+
+            try metal_ctx.setUniforms(std.mem.asBytes(&uniforms));
+            try metal_ctx.draw(.{ sky_color_vec.x, sky_color_vec.y, sky_color_vec.z, 1.0 });
+        } else {
+            _ = metal_ctx.renderFrame(sky_color_vec.x, sky_color_vec.y, sky_color_vec.z);
+        }
+
+        std.debug.print("Captured {s}\n", .{shot_path});
+    }
+
+    std.debug.print("LOD sweep complete. Images saved to {s}\n", .{scenario_dir});
+}
+
+fn runScenario(
+    allocator: std.mem.Allocator,
+    options: DemoOptions,
+    metal_ctx: *metal.MetalContext,
+    chunk_manager: *streaming.ChunkStreamingManager,
+    player_physics: *player.PlayerPhysics,
+    main_camera: *camera.Camera,
+    model_matrix: math.Mat4,
+    mesher: *mesh.GreedyMesher,
+    mesh_cache: *std.AutoHashMap(u64, CachedMesh),
+    combined_vertices: *std.ArrayListUnmanaged(metal_renderer.Vertex),
+    combined_indices: *std.ArrayListUnmanaged(u32),
+) !void {
+    switch (options.scenario) {
+        .lod_sweep => try runScenarioLodSweep(allocator, options, metal_ctx, chunk_manager, player_physics, main_camera, model_matrix, mesher, mesh_cache, combined_vertices, combined_indices),
+        else => {},
+    }
 }
 
 fn formatTimestamp(buffer: []u8, timestamp: i64) []const u8 {
@@ -94,107 +367,74 @@ fn sanitizeWorldName(allocator: std.mem.Allocator, name: []const u8) ![]u8 {
     return cleaned.toOwnedSlice(allocator);
 }
 
-fn promptLine(buffer: []u8) ![]u8 {
-    const stdin_file = std.fs.File.stdin();
-    const read_len = try stdin_file.read(buffer);
-    const slice = buffer[0..read_len];
-
-    var start: usize = 0;
-    while (start < slice.len and isWhitespace(slice[start])) : (start += 1) {}
-
-    var end = slice.len;
-    while (end > start and isWhitespace(slice[end - 1])) : (end -= 1) {}
-
-    return buffer[start..end];
-}
-
-fn isWhitespace(ch: u8) bool {
-    return ch == ' ' or ch == '\t' or ch == '\r' or ch == '\n';
-}
-
-fn renameWorldInteractive(
+fn renameWorld(
     allocator: std.mem.Allocator,
     worlds_root: []const u8,
     current_name: []const u8,
-) !bool {
-    std.debug.print("Rename world '{s}' -> ", .{current_name});
-    var input_buf: [256]u8 = undefined;
-    const raw = try promptLine(&input_buf);
-    if (raw.len == 0) return false;
+    new_name: []const u8,
+) RenameWorldError!void {
+    if (new_name.len == 0) return error.NameEmpty;
+    if (std.mem.eql(u8, new_name, current_name)) return error.NameUnchanged;
 
-    const sanitized = sanitizeWorldName(allocator, raw) catch |err| {
-        std.debug.print("Invalid name: {any}\n", .{err});
-        return false;
+    const exists = persistence.WorldPersistence.worldExists(allocator, worlds_root, new_name) catch {
+        return error.PersistenceFailure;
     };
-    defer allocator.free(sanitized);
+    if (exists) return error.AlreadyExists;
 
-    if (std.mem.eql(u8, sanitized, current_name)) {
-        std.debug.print("Name unchanged.\n", .{});
-        return false;
-    }
-
-    const exists = try persistence.WorldPersistence.worldExists(allocator, worlds_root, sanitized);
-    if (exists) {
-        std.debug.print("World '{s}' already exists.\n", .{sanitized});
-        return false;
-    }
-
-    const old_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ worlds_root, current_name });
+    const old_path = std.fmt.allocPrint(allocator, "{s}/{s}", .{ worlds_root, current_name }) catch {
+        return error.PersistenceFailure;
+    };
     defer allocator.free(old_path);
-    const new_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ worlds_root, sanitized });
+    const new_path = std.fmt.allocPrint(allocator, "{s}/{s}", .{ worlds_root, new_name }) catch {
+        return error.PersistenceFailure;
+    };
     defer allocator.free(new_path);
 
-    std.fs.cwd().rename(old_path, new_path) catch |err| {
-        std.debug.print("Failed to rename world: {any}\n", .{err});
-        return false;
+    std.fs.cwd().rename(old_path, new_path) catch {
+        return error.PersistenceFailure;
     };
 
-    const meta_path = try std.fmt.allocPrint(allocator, "{s}/{s}/world.meta", .{ worlds_root, sanitized });
+    const meta_path = std.fmt.allocPrint(allocator, "{s}/{s}/world.meta", .{ worlds_root, new_name }) catch {
+        return error.PersistenceFailure;
+    };
     defer allocator.free(meta_path);
 
-    var metadata = try persistence.WorldPersistence.loadMetadata(allocator, worlds_root, sanitized);
+    var metadata = persistence.WorldPersistence.loadMetadata(allocator, worlds_root, new_name) catch {
+        return error.PersistenceFailure;
+    };
     defer metadata.deinit(allocator);
 
     allocator.free(metadata.name);
-    metadata.name = try allocator.dupe(u8, sanitized);
+    metadata.name = allocator.dupe(u8, new_name) catch {
+        return error.PersistenceFailure;
+    };
     metadata.last_played_timestamp = std.time.timestamp();
-    try metadata.save(allocator, meta_path);
-
-    std.debug.print("World renamed to '{s}'.\n", .{sanitized});
-    return true;
+    metadata.save(allocator, meta_path) catch {
+        return error.PersistenceFailure;
+    };
 }
 
-fn updateWorldSeedInteractive(
+fn setWorldSeed(
     allocator: std.mem.Allocator,
     worlds_root: []const u8,
     world_name: []const u8,
-) !bool {
-    std.debug.print("Enter new seed for '{s}' (blank = random): ", .{world_name});
-    var input_buf: [64]u8 = undefined;
-    const raw = try promptLine(&input_buf);
-
-    var new_seed: u64 = undefined;
-    if (raw.len == 0) {
-        new_seed = generateRandomSeed();
-    } else {
-        new_seed = std.fmt.parseInt(u64, raw, 10) catch |err| {
-            std.debug.print("Invalid seed: {any}\n", .{err});
-            return false;
-        };
-    }
-
-    const meta_path = try std.fmt.allocPrint(allocator, "{s}/{s}/world.meta", .{ worlds_root, world_name });
+    new_seed: u64,
+) !void {
+    const meta_path = std.fmt.allocPrint(allocator, "{s}/{s}/world.meta", .{ worlds_root, world_name }) catch {
+        return error.PersistenceFailure;
+    };
     defer allocator.free(meta_path);
 
-    var metadata = try persistence.WorldPersistence.loadMetadata(allocator, worlds_root, world_name);
+    var metadata = persistence.WorldPersistence.loadMetadata(allocator, worlds_root, world_name) catch {
+        return error.PersistenceFailure;
+    };
     defer metadata.deinit(allocator);
 
     metadata.seed = new_seed;
     metadata.last_played_timestamp = std.time.timestamp();
-    try metadata.save(allocator, meta_path);
-
-    std.debug.print("Seed updated for '{s}' -> {d}.\n", .{ world_name, new_seed });
-    return true;
+    metadata.save(allocator, meta_path) catch {
+        return error.PersistenceFailure;
+    };
 }
 
 fn showWorldSelectionMenu(
@@ -207,6 +447,7 @@ fn showWorldSelectionMenu(
     defer {
         metal_ctx.setLineMesh(&[_]u8{}, @sizeOf(metal_renderer.Vertex)) catch {};
         metal_ctx.setUIMesh(&[_]u8{}, @sizeOf(line_text.UIVertex)) catch {};
+        window.stopTextInput();
     }
 
     var infos = try persistence.WorldPersistence.listWorlds(allocator, worlds_root);
@@ -220,6 +461,7 @@ fn showWorldSelectionMenu(
             .name = name,
             .seed = seed,
             .force_new = true,
+            .difficulty = persistence.default_world_difficulty,
         };
     }
 
@@ -233,7 +475,19 @@ fn showWorldSelectionMenu(
         .autosave_interval_seconds = persistence.default_autosave_interval_seconds,
         .backup_retention = persistence.default_region_backup_retention,
         .last_backup_timestamp = 0,
+        .difficulty = persistence.default_world_difficulty,
+        .maintenance_last_timestamp = 0,
+        .maintenance_queued = 0,
     };
+    var renaming = false;
+    var rename_buffer: [max_world_name_len]u8 = undefined;
+    var rename_len: usize = 0;
+    var editing_seed = false;
+    var seed_buffer: [seed_digits_max]u8 = undefined;
+    var seed_len: usize = 0;
+    var editing_description = false;
+    var description_buffer: [max_description_len]u8 = undefined;
+    var description_len: usize = 0;
 
     if (window.cursor_locked) {
         window.setCursorLocked(false);
@@ -246,6 +500,9 @@ fn showWorldSelectionMenu(
                 .autosave_interval_seconds = persistence.default_autosave_interval_seconds,
                 .backup_retention = persistence.default_region_backup_retention,
                 .last_backup_timestamp = 0,
+                .difficulty = persistence.default_world_difficulty,
+                .maintenance_last_timestamp = 0,
+                .maintenance_queued = 0,
             };
         };
         last_settings_selection = selection;
@@ -271,6 +528,307 @@ fn showWorldSelectionMenu(
 
         const option_count: usize = infos.len + 1;
 
+        if (renaming) {
+            const typed = input_state.takeTextInput();
+            if (typed.len > 0) {
+                var idx: usize = 0;
+                while (idx < typed.len) : (idx += 1) {
+                    const raw = typed[idx];
+                    if ((raw & 0x80) != 0) continue;
+                    var ch = raw;
+                    if (std.ascii.isAlphabetic(ch)) {
+                        ch = std.ascii.toUpper(ch);
+                    } else if (std.ascii.isDigit(ch)) {
+                        // keep as is
+                    } else if (ch == '_' or ch == '-') {
+                        // allow
+                    } else if (ch == ' ') {
+                        ch = '_';
+                    } else {
+                        continue;
+                    }
+
+                    if (rename_len >= max_world_name_len) {
+                        status_message = "NAME TOO LONG";
+                        status_timer = 2.0;
+                        break;
+                    }
+                    rename_buffer[rename_len] = ch;
+                    rename_len += 1;
+                }
+            }
+
+            if (input_state.wasKeyPressed(.backspace)) {
+                if (rename_len > 0) {
+                    rename_len -= 1;
+                }
+            }
+
+            if (input_state.wasKeyPressed(.enter)) {
+                if (rename_len == 0) {
+                    status_message = "NAME REQUIRED";
+                    status_timer = 3.0;
+                } else {
+                    const sanitized = sanitizeWorldName(allocator, rename_buffer[0..rename_len]) catch |err| switch (err) {
+                        error.InvalidWorldName => {
+                            status_message = "INVALID NAME";
+                            status_timer = 3.0;
+                            continue;
+                        },
+                        else => return err,
+                    };
+                    defer allocator.free(sanitized);
+
+                    if (std.mem.eql(u8, sanitized, infos[selection].name)) {
+                        status_message = "NAME UNCHANGED";
+                        status_timer = 2.0;
+                        continue;
+                    }
+
+                    const exists = persistence.WorldPersistence.worldExists(allocator, worlds_root, sanitized) catch |err| {
+                        status_message = std.fmt.bufPrint(&status_buffer, "Rename check failed: {any}", .{err}) catch "Rename failed";
+                        status_timer = 3.0;
+                        continue;
+                    };
+                    if (exists) {
+                        status_message = "NAME ALREADY EXISTS";
+                        status_timer = 3.0;
+                        continue;
+                    }
+
+                    renameWorld(allocator, worlds_root, infos[selection].name, sanitized) catch |err| {
+                        status_message = std.fmt.bufPrint(&status_buffer, "Rename failed: {any}", .{err}) catch "Rename failed";
+                        status_timer = 3.0;
+                        continue;
+                    };
+
+                    persistence.WorldPersistence.freeWorldInfoList(allocator, infos);
+                    infos = try persistence.WorldPersistence.listWorlds(allocator, worlds_root);
+                    var new_selection: usize = 0;
+                    for (infos, 0..) |info, idx| {
+                        if (std.mem.eql(u8, info.name, sanitized)) {
+                            new_selection = idx;
+                            break;
+                        }
+                    }
+                    selection = new_selection;
+                    renaming = false;
+                    rename_len = 0;
+                    window.stopTextInput();
+                    status_message = "WORLD RENAMED";
+                    status_timer = 3.0;
+                    last_settings_selection = null;
+                    continue;
+                }
+            } else if (input_state.wasKeyPressed(.escape)) {
+                renaming = false;
+                rename_len = 0;
+                window.stopTextInput();
+                status_message = "Rename canceled";
+                status_timer = 2.0;
+                continue;
+            }
+
+            var overlay_settings: ?persistence.WorldSettingsSummary = null;
+            if (selection < infos.len) {
+                overlay_settings = selected_settings;
+            }
+
+            try renderWorldSelectionOverlay(
+                allocator,
+                metal_ctx,
+                infos,
+                selection,
+                null,
+                status_message,
+                overlay_settings,
+                rename_buffer[0..rename_len],
+                null,
+                null,
+                window.width,
+                window.height,
+            );
+
+            std.Thread.sleep(16 * std.time.ns_per_ms);
+            continue;
+        }
+
+        if (editing_seed) {
+            const typed_seed = input_state.takeTextInput();
+            if (typed_seed.len > 0) {
+                for (typed_seed) |raw| {
+                    if (raw >= '0' and raw <= '9') {
+                        if (seed_len < seed_digits_max) {
+                            seed_buffer[seed_len] = raw;
+                            seed_len += 1;
+                        } else {
+                            status_message = "SEED TOO LONG";
+                            status_timer = 2.0;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if (input_state.wasKeyPressed(.backspace)) {
+                if (seed_len > 0) seed_len -= 1;
+            }
+
+            if (input_state.wasKeyPressed(.r)) {
+                const random_seed = generateRandomSeed();
+                var tmp: [seed_digits_max]u8 = undefined;
+                const slice = std.fmt.bufPrint(&tmp, "{d}", .{random_seed}) catch "0";
+                const count = @min(slice.len, seed_digits_max);
+                std.mem.copyForwards(u8, seed_buffer[0..count], slice[0..count]);
+                seed_len = count;
+                status_message = std.fmt.bufPrint(&status_buffer, "Random seed staged: {d}", .{random_seed}) catch "Random seed";
+                status_timer = 3.0;
+            }
+
+            if (input_state.wasKeyPressed(.enter)) {
+                var new_seed: u64 = undefined;
+                if (seed_len == 0) {
+                    new_seed = generateRandomSeed();
+                    var tmp: [seed_digits_max]u8 = undefined;
+                    const slice = std.fmt.bufPrint(&tmp, "{d}", .{new_seed}) catch "0";
+                    const count = @min(slice.len, seed_digits_max);
+                    std.mem.copyForwards(u8, seed_buffer[0..count], slice[0..count]);
+                    seed_len = count;
+                } else {
+                    new_seed = std.fmt.parseInt(u64, seed_buffer[0..seed_len], 10) catch {
+                        status_message = "INVALID SEED";
+                        status_timer = 3.0;
+                        continue;
+                    };
+                }
+
+                const current_name_copy = try allocator.dupe(u8, infos[selection].name);
+                defer allocator.free(current_name_copy);
+
+                setWorldSeed(allocator, worlds_root, current_name_copy, new_seed) catch |err| {
+                    status_message = std.fmt.bufPrint(&status_buffer, "Seed update failed: {any}", .{err}) catch "Seed update failed";
+                    status_timer = 3.0;
+                    continue;
+                };
+
+                persistence.WorldPersistence.freeWorldInfoList(allocator, infos);
+                infos = try persistence.WorldPersistence.listWorlds(allocator, worlds_root);
+                var new_selection: usize = 0;
+                for (infos, 0..) |info, idx| {
+                    if (std.mem.eql(u8, info.name, current_name_copy)) {
+                        new_selection = idx;
+                        break;
+                    }
+                }
+                selection = new_selection;
+                editing_seed = false;
+                seed_len = 0;
+                window.stopTextInput();
+                status_message = std.fmt.bufPrint(&status_buffer, "Seed set to {d}", .{new_seed}) catch "Seed updated";
+                status_timer = 3.0;
+                last_settings_selection = null;
+                continue;
+            } else if (input_state.wasKeyPressed(.escape)) {
+                editing_seed = false;
+                seed_len = 0;
+                window.stopTextInput();
+                status_message = "Seed edit canceled";
+                status_timer = 2.0;
+                continue;
+            }
+
+            var overlay_settings_seed: ?persistence.WorldSettingsSummary = null;
+            if (selection < infos.len) overlay_settings_seed = selected_settings;
+
+            try renderWorldSelectionOverlay(
+                allocator,
+                metal_ctx,
+                infos,
+                selection,
+                null,
+                status_message,
+                overlay_settings_seed,
+                null,
+                seed_buffer[0..seed_len],
+                null,
+                window.width,
+                window.height,
+            );
+
+            std.Thread.sleep(16 * std.time.ns_per_ms);
+            continue;
+        }
+
+        if (editing_description) {
+            const typed_desc = input_state.takeTextInput();
+            if (typed_desc.len > 0) {
+                for (typed_desc) |raw| {
+                    if (raw == '\r' or raw == '\n') continue;
+                    if (raw >= 32 and raw <= 126) {
+                        if (description_len < max_description_len) {
+                            description_buffer[description_len] = raw;
+                            description_len += 1;
+                        } else {
+                            status_message = "DESC TOO LONG";
+                            status_timer = 2.0;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if (input_state.wasKeyPressed(.backspace)) {
+                if (description_len > 0) description_len -= 1;
+            }
+
+            if (input_state.wasKeyPressed(.enter)) {
+                const new_desc = description_buffer[0..description_len];
+                persistence.setWorldDescription(allocator, worlds_root, infos[selection].name, new_desc) catch |err| {
+                    status_message = std.fmt.bufPrint(&status_buffer, "Desc update failed: {any}", .{err}) catch "Desc update failed";
+                    status_timer = 3.0;
+                    continue;
+                };
+                persistence.WorldPersistence.freeWorldInfoList(allocator, infos);
+                infos = try persistence.WorldPersistence.listWorlds(allocator, worlds_root);
+                if (selection >= infos.len) selection = infos.len - 1;
+                editing_description = false;
+                description_len = 0;
+                window.stopTextInput();
+                status_message = "DESCRIPTION SAVED";
+                status_timer = 3.0;
+                last_settings_selection = null;
+                continue;
+            } else if (input_state.wasKeyPressed(.escape)) {
+                editing_description = false;
+                description_len = 0;
+                window.stopTextInput();
+                status_message = "Description edit canceled";
+                status_timer = 2.0;
+                continue;
+            }
+
+            var overlay_settings_desc: ?persistence.WorldSettingsSummary = null;
+            if (selection < infos.len) overlay_settings_desc = selected_settings;
+
+            try renderWorldSelectionOverlay(
+                allocator,
+                metal_ctx,
+                infos,
+                selection,
+                null,
+                status_message,
+                overlay_settings_desc,
+                null,
+                null,
+                description_buffer[0..description_len],
+                window.width,
+                window.height,
+            );
+
+            std.Thread.sleep(16 * std.time.ns_per_ms);
+            continue;
+        }
+
         if (input_state.wasKeyPressed(.down)) {
             selection = (selection + 1) % option_count;
             confirm_delete = null;
@@ -294,6 +852,9 @@ fn showWorldSelectionMenu(
                         .autosave_interval_seconds = persistence.default_autosave_interval_seconds,
                         .backup_retention = persistence.default_region_backup_retention,
                         .last_backup_timestamp = 0,
+                        .difficulty = persistence.default_world_difficulty,
+                        .maintenance_last_timestamp = 0,
+                        .maintenance_queued = 0,
                     };
                 };
                 last_settings_selection = selection;
@@ -302,33 +863,81 @@ fn showWorldSelectionMenu(
             last_settings_selection = null;
         }
 
-        if (selection < infos.len and input_state.wasKeyPressed(.r)) {
-            if (try renameWorldInteractive(allocator, worlds_root, infos[selection].name)) {
-                persistence.WorldPersistence.freeWorldInfoList(allocator, infos);
-                infos = try persistence.WorldPersistence.listWorlds(allocator, worlds_root);
-                if (selection >= infos.len) selection = infos.len - 1;
-                last_settings_selection = null;
-                status_message = "RENAMED WORLD";
-                status_timer = 3.0;
-            } else {
-                status_message = "RENAME FAILED";
-                status_timer = 3.0;
+        if (selection < infos.len and input_state.wasKeyPressed(.f10)) {
+            editing_description = true;
+            renaming = false;
+            editing_seed = false;
+            rename_len = 0;
+            seed_len = 0;
+            description_len = 0;
+            if (infos[selection].description.len > 0) {
+                const copy_len = @min(infos[selection].description.len, max_description_len);
+                std.mem.copyForwards(u8, description_buffer[0..copy_len], infos[selection].description[0..copy_len]);
+                description_len = copy_len;
             }
+            window.startTextInput();
+            status_message = "EDIT DESCRIPTION - ENTER confirm, ESC cancel";
+            status_timer = 0;
+            confirm_delete = null;
+            continue;
+        }
+
+        if (!renaming and !editing_seed and !editing_description and selection < infos.len) {
+            var diff_delta: i32 = 0;
+            if (input_state.wasKeyPressed(.f1)) diff_delta -= 1;
+            if (input_state.wasKeyPressed(.f2)) diff_delta += 1;
+            if (diff_delta != 0) {
+                const current_diff = selected_settings.difficulty;
+                const new_diff = cycleDifficulty(current_diff, diff_delta);
+                if (new_diff != current_diff) {
+                    persistence.setWorldDifficulty(allocator, worlds_root, infos[selection].name, new_diff) catch |err| {
+                        status_message = std.fmt.bufPrint(&status_buffer, "Difficulty update failed: {any}", .{err}) catch "Difficulty update failed";
+                        status_timer = 3.0;
+                        continue;
+                    };
+
+                    selected_settings.difficulty = new_diff;
+                    infos[selection].difficulty = new_diff;
+                    status_message = std.fmt.bufPrint(&status_buffer, "Difficulty: {s}", .{difficultyLabelShort(new_diff)}) catch "Difficulty updated";
+                    status_timer = 3.0;
+                    continue;
+                }
+            }
+        }
+
+        if (selection < infos.len and input_state.wasKeyPressed(.r)) {
+            renaming = true;
+            editing_seed = false;
+            seed_len = 0;
+            rename_len = 0;
+            const current = infos[selection].name;
+            const limit = @min(current.len, max_world_name_len);
+            if (limit > 0) {
+                std.mem.copyForwards(u8, rename_buffer[0..limit], current[0..limit]);
+                rename_len = limit;
+            }
+            window.startTextInput();
+            status_message = "RENAME WORLD - ENTER confirm, ESC cancel";
+            status_timer = 0;
             confirm_delete = null;
             continue;
         }
 
         if (selection < infos.len and input_state.wasKeyPressed(.s)) {
-            if (try updateWorldSeedInteractive(allocator, worlds_root, infos[selection].name)) {
-                persistence.WorldPersistence.freeWorldInfoList(allocator, infos);
-                infos = try persistence.WorldPersistence.listWorlds(allocator, worlds_root);
-                last_settings_selection = null;
-                status_message = "SEED UPDATED";
-                status_timer = 3.0;
-            } else {
-                status_message = "SEED UPDATE FAILED";
-                status_timer = 3.0;
+            editing_seed = true;
+            renaming = false;
+            rename_len = 0;
+            seed_len = 0;
+            var tmp_seed: [seed_digits_max]u8 = undefined;
+            const slice = std.fmt.bufPrint(&tmp_seed, "{d}", .{infos[selection].seed}) catch null;
+            if (slice) |s| {
+                const count = @min(s.len, seed_digits_max);
+                std.mem.copyForwards(u8, seed_buffer[0..count], s[0..count]);
+                seed_len = count;
             }
+            window.startTextInput();
+            status_message = "EDIT SEED - digits only, blank = random, R = reroll";
+            status_timer = 0;
             confirm_delete = null;
             continue;
         }
@@ -345,6 +954,7 @@ fn showWorldSelectionMenu(
                         confirm_delete = null;
                         continue;
                     };
+                    std.debug.print("Deleted world '{s}'.\n", .{target});
                     persistence.WorldPersistence.freeWorldInfoList(allocator, infos);
                     infos = try persistence.WorldPersistence.listWorlds(allocator, worlds_root);
                     if (infos.len == 0) {
@@ -355,6 +965,7 @@ fn showWorldSelectionMenu(
                             .name = name,
                             .seed = seed,
                             .force_new = true,
+                            .difficulty = persistence.default_world_difficulty,
                         };
                     }
                     if (selection >= infos.len) selection = infos.len - 1;
@@ -366,11 +977,13 @@ fn showWorldSelectionMenu(
                     confirm_delete = selection;
                     status_message = "PRESS DELETE AGAIN TO CONFIRM";
                     status_timer = 3.0;
+                    std.debug.print("Press Delete again to confirm removal of '{s}'.\n", .{infos[selection].name});
                 }
             } else {
                 confirm_delete = selection;
                 status_message = "PRESS DELETE AGAIN TO CONFIRM";
                 status_timer = 3.0;
+                std.debug.print("Press Delete again to confirm removal of '{s}'.\n", .{infos[selection].name});
             }
             continue;
         }
@@ -607,8 +1220,12 @@ fn showWorldSelectionMenu(
                             .autosave_interval_seconds = persistence.default_autosave_interval_seconds,
                             .backup_retention = persistence.default_region_backup_retention,
                             .last_backup_timestamp = 0,
+                            .difficulty = persistence.default_world_difficulty,
+                            .maintenance_last_timestamp = 0,
+                            .maintenance_queued = 0,
                         };
                     };
+                    infos[selection].difficulty = selected_settings.difficulty;
                     status_message = "SETTINGS RESET";
                     status_timer = 3.0;
                     std.debug.print("World '{s}' settings reset to defaults.\n", .{world_name});
@@ -625,6 +1242,7 @@ fn showWorldSelectionMenu(
                     .name = name_copy,
                     .seed = info.seed,
                     .force_new = false,
+                    .difficulty = selected_settings.difficulty,
                 };
             } else {
                 const name = try generateUniqueWorldName(allocator, worlds_root);
@@ -635,6 +1253,7 @@ fn showWorldSelectionMenu(
                     .name = name,
                     .seed = seed,
                     .force_new = true,
+                    .difficulty = persistence.default_world_difficulty,
                 };
             }
         }
@@ -656,6 +1275,9 @@ fn showWorldSelectionMenu(
             confirm_delete,
             status_message,
             overlay_settings,
+            null,
+            null,
+            null,
             window.width,
             window.height,
         );
@@ -672,6 +1294,9 @@ fn renderWorldSelectionOverlay(
     confirm_delete: ?usize,
     status_message: []const u8,
     selected_settings: ?persistence.WorldSettingsSummary,
+    rename_text: ?[]const u8,
+    seed_text: ?[]const u8,
+    description_text: ?[]const u8,
     screen_width: u32,
     screen_height: u32,
 ) !void {
@@ -698,6 +1323,11 @@ fn renderWorldSelectionOverlay(
             max_width = @max(max_width, line_text.textWidth(detail_text, text_scale));
             line_count += 1;
 
+            const diff_value = if (selected_settings) |settings| settings.difficulty else infos[idx].difficulty;
+            const diff_text = std.fmt.bufPrint(&buf, "DIFFICULTY: {s}", .{difficultyLabelShort(diff_value)}) catch "DIFFICULTY";
+            max_width = @max(max_width, line_text.textWidth(diff_text, text_scale));
+            line_count += 1;
+
             if (selected_settings) |settings| {
                 const autosave_text = if (settings.autosave_interval_seconds == 0)
                     "AUTOSAVE: OFF"
@@ -710,9 +1340,59 @@ fn renderWorldSelectionOverlay(
                 max_width = @max(max_width, line_text.textWidth(retention_text, text_scale));
                 line_count += 1;
 
+                const maintenance_minutes = @divFloor(streaming.default_backup_schedule_interval_seconds + 59, 60);
+                const maintenance_text = std.fmt.bufPrint(&buf, "MAINT: EVERY {d}m", .{maintenance_minutes}) catch "MAINT";
+                max_width = @max(max_width, line_text.textWidth(maintenance_text, text_scale));
+                line_count += 1;
+
+                const maint_queue_text = std.fmt.bufPrint(&buf, "MAINT: QUEUED {d}", .{settings.maintenance_queued}) catch "MAINT QUEUED";
+                max_width = @max(max_width, line_text.textWidth(maint_queue_text, text_scale));
+                line_count += 1;
+
                 const ts_str = formatTimestamp(&timestamp_buf, settings.last_backup_timestamp);
                 const backup_last_text = std.fmt.bufPrint(&buf, "BACKUP: LAST {s}", .{ts_str}) catch "BACKUP LAST";
                 max_width = @max(max_width, line_text.textWidth(backup_last_text, text_scale));
+                line_count += 1;
+
+                const maint_last_str = formatTimestamp(&timestamp_buf, settings.maintenance_last_timestamp);
+                const maint_last_text = std.fmt.bufPrint(&buf, "MAINT: LAST {s}", .{maint_last_str}) catch "MAINT LAST";
+                max_width = @max(max_width, line_text.textWidth(maint_last_text, text_scale));
+                line_count += 1;
+            }
+
+            if (rename_text) |text| {
+                const rename_preview = std.fmt.bufPrint(&buf, "RENAME: {s}_", .{text}) catch "RENAME";
+                max_width = @max(max_width, line_text.textWidth(rename_preview, text_scale));
+                line_count += 1;
+                max_width = @max(max_width, line_text.textWidth("ENTER confirm  ESC cancel", text_scale));
+                line_count += 1;
+            }
+
+            if (seed_text) |text| {
+                const seed_preview = if (text.len == 0)
+                    "SEED: _"
+                else
+                    std.fmt.bufPrint(&buf, "SEED: {s}_", .{text}) catch "SEED";
+                max_width = @max(max_width, line_text.textWidth(seed_preview, text_scale));
+                line_count += 1;
+                max_width = @max(max_width, line_text.textWidth("ENTER confirm  ESC cancel  R random (blank=random)", text_scale));
+                line_count += 1;
+            }
+
+            if (description_text) |text| {
+                const preview_slice = if (text.len > 64) text[0..64] else text;
+                const desc_preview = std.fmt.bufPrint(&buf, "DESC: {s}_", .{preview_slice}) catch "DESC";
+                max_width = @max(max_width, line_text.textWidth(desc_preview, text_scale));
+                line_count += 1;
+                max_width = @max(max_width, line_text.textWidth("ENTER confirm  ESC cancel", text_scale));
+                line_count += 1;
+            } else if (info.description.len > 0) {
+                const desc_slice = if (info.description.len > 64)
+                    info.description[0..64]
+                else
+                    info.description;
+                const desc_line = std.fmt.bufPrint(&buf, "DESC: {s}", .{desc_slice}) catch "DESC";
+                max_width = @max(max_width, line_text.textWidth(desc_line, text_scale));
                 line_count += 1;
             }
 
@@ -734,7 +1414,7 @@ fn renderWorldSelectionOverlay(
     }
 
     const instructions_primary = "ENTER PLAY  R RENAME  S SEED  DEL/BKSP DELETE  ESC QUIT";
-    const instructions_secondary = "F5 CYCLE AUTOSAVE  F7/F8 BACKUPS  F9 RESET";
+    const instructions_secondary = "F1/F2 DIFFICULTY  F5 AUTOSAVE  F7/F8 BACKUPS  F9 RESET  F10 DESC  F11 BACKUP";
     max_width = @max(max_width, line_text.textWidth(instructions_primary, text_scale));
     line_count += 1;
     max_width = @max(max_width, line_text.textWidth(instructions_secondary, text_scale));
@@ -766,6 +1446,11 @@ fn renderWorldSelectionOverlay(
             try line_text.appendText(&builder, allocator, detail_text, cursor, text_scale, screen_size, [4]f32{ 0.75, 0.88, 0.95, 1.0 });
             cursor.y += line_height;
 
+            const diff_value = if (selected_settings) |settings| settings.difficulty else infos[idx].difficulty;
+            const diff_line = std.fmt.bufPrint(&buf, "DIFFICULTY: {s}", .{difficultyLabelShort(diff_value)}) catch "DIFFICULTY";
+            try line_text.appendText(&builder, allocator, diff_line, cursor, text_scale, screen_size, [4]f32{ 0.95, 0.9, 0.7, 1.0 });
+            cursor.y += line_height;
+
             if (selected_settings) |settings| {
                 const autosave_line = if (settings.autosave_interval_seconds == 0)
                     "AUTOSAVE: OFF"
@@ -778,9 +1463,65 @@ fn renderWorldSelectionOverlay(
                 try line_text.appendText(&builder, allocator, retention_line, cursor, text_scale, screen_size, [4]f32{ 0.68, 0.92, 0.78, 1.0 });
                 cursor.y += line_height;
 
+                const maintenance_minutes = @divFloor(streaming.default_backup_schedule_interval_seconds + 59, 60);
+                const maintenance_line = std.fmt.bufPrint(&buf, "MAINT: EVERY {d}m", .{maintenance_minutes}) catch "MAINT";
+                try line_text.appendText(&builder, allocator, maintenance_line, cursor, text_scale, screen_size, [4]f32{ 0.7, 0.9, 1.0, 1.0 });
+                cursor.y += line_height;
+
+                const maintenance_queue_line = std.fmt.bufPrint(&buf, "MAINT: QUEUED {d}", .{settings.maintenance_queued}) catch "MAINT QUEUED";
+                try line_text.appendText(&builder, allocator, maintenance_queue_line, cursor, text_scale, screen_size, [4]f32{ 0.7, 0.9, 1.0, 1.0 });
+                cursor.y += line_height;
+
                 const ts_str = formatTimestamp(&timestamp_buf, settings.last_backup_timestamp);
                 const last_backup_line = std.fmt.bufPrint(&buf, "BACKUP: LAST {s}", .{ts_str}) catch "BACKUP LAST";
                 try line_text.appendText(&builder, allocator, last_backup_line, cursor, text_scale, screen_size, [4]f32{ 0.8, 0.85, 1.0, 1.0 });
+                cursor.y += line_height;
+
+                const maintenance_last_str = formatTimestamp(&timestamp_buf, settings.maintenance_last_timestamp);
+                const maintenance_last_line = std.fmt.bufPrint(&buf, "MAINT: LAST {s}", .{maintenance_last_str}) catch "MAINT LAST";
+                try line_text.appendText(&builder, allocator, maintenance_last_line, cursor, text_scale, screen_size, [4]f32{ 0.7, 0.9, 1.0, 1.0 });
+                cursor.y += line_height;
+            }
+
+            if (rename_text) |text| {
+                const rename_line = std.fmt.bufPrint(&buf, "RENAME: {s}_", .{text}) catch "RENAME";
+                try line_text.appendText(&builder, allocator, rename_line, cursor, text_scale, screen_size, [4]f32{ 1.0, 0.95, 0.7, 1.0 });
+                cursor.y += line_height;
+
+                const rename_hint = "ENTER confirm  ESC cancel";
+                try line_text.appendText(&builder, allocator, rename_hint, cursor, text_scale, screen_size, [4]f32{ 0.85, 0.9, 1.0, 1.0 });
+                cursor.y += line_height;
+            }
+
+            if (seed_text) |text| {
+                const seed_line = if (text.len == 0)
+                    "SEED: _"
+                else
+                    std.fmt.bufPrint(&buf, "SEED: {s}_", .{text}) catch "SEED";
+                try line_text.appendText(&builder, allocator, seed_line, cursor, text_scale, screen_size, [4]f32{ 0.95, 0.85, 0.7, 1.0 });
+                cursor.y += line_height;
+
+                const seed_hint = "ENTER confirm  ESC cancel  R random (blank=random)";
+                try line_text.appendText(&builder, allocator, seed_hint, cursor, text_scale, screen_size, [4]f32{ 0.8, 0.9, 1.0, 1.0 });
+                cursor.y += line_height;
+            }
+
+            if (description_text) |text| {
+                const preview_slice = if (text.len > 64) text[0..64] else text;
+                const desc_line = std.fmt.bufPrint(&buf, "DESC: {s}_", .{preview_slice}) catch "DESC";
+                try line_text.appendText(&builder, allocator, desc_line, cursor, text_scale, screen_size, [4]f32{ 0.9, 0.95, 0.85, 1.0 });
+                cursor.y += line_height;
+
+                const desc_hint = "ENTER confirm  ESC cancel";
+                try line_text.appendText(&builder, allocator, desc_hint, cursor, text_scale, screen_size, [4]f32{ 0.8, 0.9, 1.0, 1.0 });
+                cursor.y += line_height;
+            } else if (info.description.len > 0) {
+                const desc_slice = if (info.description.len > 64)
+                    info.description[0..64]
+                else
+                    info.description;
+                const desc_line = std.fmt.bufPrint(&buf, "DESC: {s}", .{desc_slice}) catch "DESC";
+                try line_text.appendText(&builder, allocator, desc_line, cursor, text_scale, screen_size, [4]f32{ 0.9, 0.95, 0.85, 1.0 });
                 cursor.y += line_height;
             }
 
@@ -815,11 +1556,14 @@ fn renderWorldSelectionOverlay(
     try metal_ctx.draw(.{ 0.05, 0.08, 0.12, 1.0 });
 }
 
+const MeshDetail = streaming.ChunkDetail;
+
 const CachedMesh = struct {
     vertices: []metal_renderer.Vertex,
     indices: []u32,
     in_use: bool,
     selected: bool,
+    detail: MeshDetail,
 };
 
 const MeshUpdateStats = struct {
@@ -831,11 +1575,22 @@ const MeshUpdateStats = struct {
     budget_skipped: usize,
     total_vertices: usize,
     total_indices: usize,
+    full_chunks: usize,
+    medium_chunks: usize,
+    far_chunks: usize,
+    regenerations: usize,
 };
 
-const max_render_chunks: usize = 96;
-const max_vertex_budget: usize = 12_000_000;
+const max_render_chunks: usize = 192;
+const max_vertex_budget: usize = 18_000_000;
 const max_index_budget: usize = max_vertex_budget * 3;
+const medium_start_distance: f32 = 24.0;
+const far_start_distance: f32 = 64.0;
+const medium_distance_sq: f32 = medium_start_distance * medium_start_distance;
+const far_distance_sq: f32 = far_start_distance * far_start_distance;
+const medium_cell_size: usize = 2;
+const far_cell_size: usize = 4;
+const default_meshes_per_frame: usize = 3;
 
 fn lerp(a: f32, b: f32, t: f32) f32 {
     return math.lerp(a, b, t);
@@ -910,41 +1665,41 @@ fn generateCubeOutlineVertices(allocator: std.mem.Allocator, pos: math.Vec3i, of
     };
 
     // 12 edges, 2 vertices each = 24 vertices
-    const white = [4]f32{ 1.0, 1.0, 1.0, 1.0 };
-    const normal = [3]f32{ 0.0, 1.0, 0.0 };
+    const outline_color = [4]f32{ 2.5, 2.5, 2.5, 1.0 };
+    const normal = [3]f32{ 0.0, 0.0, 0.0 };
     const uv = [2]f32{ 0.0, 0.0 };
 
     var vertices = try allocator.alloc(metal_renderer.Vertex, 24);
 
     // Bottom edges
-    vertices[0] = .{ .position = corners[0], .normal = normal, .tex_coord = uv, .color = white };
-    vertices[1] = .{ .position = corners[1], .normal = normal, .tex_coord = uv, .color = white };
-    vertices[2] = .{ .position = corners[1], .normal = normal, .tex_coord = uv, .color = white };
-    vertices[3] = .{ .position = corners[2], .normal = normal, .tex_coord = uv, .color = white };
-    vertices[4] = .{ .position = corners[2], .normal = normal, .tex_coord = uv, .color = white };
-    vertices[5] = .{ .position = corners[3], .normal = normal, .tex_coord = uv, .color = white };
-    vertices[6] = .{ .position = corners[3], .normal = normal, .tex_coord = uv, .color = white };
-    vertices[7] = .{ .position = corners[0], .normal = normal, .tex_coord = uv, .color = white };
+    vertices[0] = .{ .position = corners[0], .normal = normal, .tex_coord = uv, .color = outline_color };
+    vertices[1] = .{ .position = corners[1], .normal = normal, .tex_coord = uv, .color = outline_color };
+    vertices[2] = .{ .position = corners[1], .normal = normal, .tex_coord = uv, .color = outline_color };
+    vertices[3] = .{ .position = corners[2], .normal = normal, .tex_coord = uv, .color = outline_color };
+    vertices[4] = .{ .position = corners[2], .normal = normal, .tex_coord = uv, .color = outline_color };
+    vertices[5] = .{ .position = corners[3], .normal = normal, .tex_coord = uv, .color = outline_color };
+    vertices[6] = .{ .position = corners[3], .normal = normal, .tex_coord = uv, .color = outline_color };
+    vertices[7] = .{ .position = corners[0], .normal = normal, .tex_coord = uv, .color = outline_color };
 
     // Top edges
-    vertices[8] = .{ .position = corners[4], .normal = normal, .tex_coord = uv, .color = white };
-    vertices[9] = .{ .position = corners[5], .normal = normal, .tex_coord = uv, .color = white };
-    vertices[10] = .{ .position = corners[5], .normal = normal, .tex_coord = uv, .color = white };
-    vertices[11] = .{ .position = corners[6], .normal = normal, .tex_coord = uv, .color = white };
-    vertices[12] = .{ .position = corners[6], .normal = normal, .tex_coord = uv, .color = white };
-    vertices[13] = .{ .position = corners[7], .normal = normal, .tex_coord = uv, .color = white };
-    vertices[14] = .{ .position = corners[7], .normal = normal, .tex_coord = uv, .color = white };
-    vertices[15] = .{ .position = corners[4], .normal = normal, .tex_coord = uv, .color = white };
+    vertices[8] = .{ .position = corners[4], .normal = normal, .tex_coord = uv, .color = outline_color };
+    vertices[9] = .{ .position = corners[5], .normal = normal, .tex_coord = uv, .color = outline_color };
+    vertices[10] = .{ .position = corners[5], .normal = normal, .tex_coord = uv, .color = outline_color };
+    vertices[11] = .{ .position = corners[6], .normal = normal, .tex_coord = uv, .color = outline_color };
+    vertices[12] = .{ .position = corners[6], .normal = normal, .tex_coord = uv, .color = outline_color };
+    vertices[13] = .{ .position = corners[7], .normal = normal, .tex_coord = uv, .color = outline_color };
+    vertices[14] = .{ .position = corners[7], .normal = normal, .tex_coord = uv, .color = outline_color };
+    vertices[15] = .{ .position = corners[4], .normal = normal, .tex_coord = uv, .color = outline_color };
 
     // Vertical edges
-    vertices[16] = .{ .position = corners[0], .normal = normal, .tex_coord = uv, .color = white };
-    vertices[17] = .{ .position = corners[4], .normal = normal, .tex_coord = uv, .color = white };
-    vertices[18] = .{ .position = corners[1], .normal = normal, .tex_coord = uv, .color = white };
-    vertices[19] = .{ .position = corners[5], .normal = normal, .tex_coord = uv, .color = white };
-    vertices[20] = .{ .position = corners[2], .normal = normal, .tex_coord = uv, .color = white };
-    vertices[21] = .{ .position = corners[6], .normal = normal, .tex_coord = uv, .color = white };
-    vertices[22] = .{ .position = corners[3], .normal = normal, .tex_coord = uv, .color = white };
-    vertices[23] = .{ .position = corners[7], .normal = normal, .tex_coord = uv, .color = white };
+    vertices[16] = .{ .position = corners[0], .normal = normal, .tex_coord = uv, .color = outline_color };
+    vertices[17] = .{ .position = corners[4], .normal = normal, .tex_coord = uv, .color = outline_color };
+    vertices[18] = .{ .position = corners[1], .normal = normal, .tex_coord = uv, .color = outline_color };
+    vertices[19] = .{ .position = corners[5], .normal = normal, .tex_coord = uv, .color = outline_color };
+    vertices[20] = .{ .position = corners[2], .normal = normal, .tex_coord = uv, .color = outline_color };
+    vertices[21] = .{ .position = corners[6], .normal = normal, .tex_coord = uv, .color = outline_color };
+    vertices[22] = .{ .position = corners[3], .normal = normal, .tex_coord = uv, .color = outline_color };
+    vertices[23] = .{ .position = corners[7], .normal = normal, .tex_coord = uv, .color = outline_color };
 
     return vertices;
 }
@@ -980,6 +1735,7 @@ fn updateGpuMeshes(
     combined_indices: *std.ArrayListUnmanaged(u32),
     frustum: math.Frustum,
     camera_pos: math.Vec3,
+    max_meshes_per_frame: usize,
 ) !MeshUpdateStats {
     var stats = MeshUpdateStats{
         .changed = false,
@@ -990,11 +1746,14 @@ fn updateGpuMeshes(
         .budget_skipped = 0,
         .total_vertices = 0,
         .total_indices = 0,
+        .full_chunks = 0,
+        .medium_chunks = 0,
+        .far_chunks = 0,
+        .regenerations = 0,
     };
     const atlas_tile_size = 1.0 / @as(f32, @floatFromInt(textures.tiles_per_row));
 
     // Limit mesh generation per frame to avoid stuttering
-    const max_meshes_per_frame: usize = 3;
     var meshes_generated_this_frame: usize = 0;
 
     var cache_it = mesh_cache.iterator();
@@ -1063,6 +1822,36 @@ fn updateGpuMeshes(
     for (candidates.items) |candidate| {
         const key = candidate.key;
         const chunk_ptr = candidate.chunk_ptr;
+        const chunk_pos = streaming.ChunkPos.init(chunk_ptr.x, chunk_ptr.z);
+
+        const current_detail = chunk_manager.getChunkDetail(chunk_pos) orelse .full;
+        const previous_desired = chunk_manager.getDesiredDetail(chunk_pos) orelse current_detail;
+        var target_detail = previous_desired;
+        const dist2 = candidate.distance2;
+        switch (previous_desired) {
+            .full => {
+                if (dist2 > far_distance_sq + far_distance_sq * 0.1) {
+                    target_detail = .surfaceFar;
+                } else if (dist2 > medium_distance_sq + medium_distance_sq * 0.1) {
+                    target_detail = .surfaceMedium;
+                }
+            },
+            .surfaceMedium => {
+                if (dist2 > far_distance_sq + far_distance_sq * 0.1) {
+                    target_detail = .surfaceFar;
+                } else if (dist2 < medium_distance_sq * 0.85) {
+                    target_detail = .full;
+                }
+            },
+            .surfaceFar => {
+                if (dist2 < medium_distance_sq * 0.85) {
+                    target_detail = .full;
+                } else if (dist2 < far_distance_sq * 0.8) {
+                    target_detail = .surfaceMedium;
+                }
+            },
+        }
+        chunk_manager.setDesiredDetail(chunk_pos, target_detail);
 
         var cache_entry_ptr_opt = mesh_cache.getPtr(key);
         if (cache_entry_ptr_opt == null) {
@@ -1071,6 +1860,7 @@ fn updateGpuMeshes(
                 .indices = &[_]u32{},
                 .in_use = false,
                 .selected = false,
+                .detail = .full,
             });
             cache_entry_ptr_opt = mesh_cache.getPtr(key);
             stats.changed = true;
@@ -1083,12 +1873,18 @@ fn updateGpuMeshes(
         cache_entry.selected = false;
         cache_entry.in_use = true;
 
-        if (chunk_ptr.modified or cache_entry.vertices.len == 0) {
+        const needs_regen = chunk_ptr.modified or cache_entry.vertices.len == 0 or cache_entry.detail != target_detail;
+        var regenerated = false;
+        if (needs_regen) {
             if (meshes_generated_this_frame < max_meshes_per_frame) {
                 if (cache_entry.vertices.len > 0) allocator.free(cache_entry.vertices);
                 if (cache_entry.indices.len > 0) allocator.free(cache_entry.indices);
 
-                var chunk_mesh = try mesher.generateMesh(chunk_ptr);
+                var chunk_mesh = switch (target_detail) {
+                    .full => try mesher.generateMesh(chunk_ptr),
+                    .surfaceMedium => try mesher.generateSurfaceMesh(chunk_ptr, medium_cell_size, false),
+                    .surfaceFar => try mesher.generateSurfaceMesh(chunk_ptr, far_cell_size, true),
+                };
                 defer chunk_mesh.deinit();
                 meshes_generated_this_frame += 1;
 
@@ -1147,7 +1943,13 @@ fn updateGpuMeshes(
                 }
 
                 chunk_ptr.modified = false;
+                cache_entry.detail = target_detail;
                 stats.changed = true;
+                regenerated = true;
+                stats.regenerations += 1;
+            } else {
+                cache_entry_ptr.* = cache_entry;
+                continue;
             }
         }
 
@@ -1169,6 +1971,7 @@ fn updateGpuMeshes(
             cache_entry.in_use = true;
             cache_entry.selected = false;
             if (was_selected) stats.changed = true;
+            chunk_manager.setChunkDetail(chunk_pos, current_detail);
             cache_entry_ptr.* = cache_entry;
             continue;
         }
@@ -1181,6 +1984,13 @@ fn updateGpuMeshes(
         vertex_budget_used += vertex_count;
         index_budget_used += index_count;
         stats.rendered_chunks += 1;
+
+        chunk_manager.setChunkDetail(chunk_pos, cache_entry.detail);
+        switch (cache_entry.detail) {
+            .full => stats.full_chunks += 1,
+            .surfaceMedium => stats.medium_chunks += 1,
+            .surfaceFar => stats.far_chunks += 1,
+        }
     }
 
     var keys_to_remove = std.ArrayListUnmanaged(u64){};
@@ -1226,6 +2036,148 @@ fn updateGpuMeshes(
     return stats;
 }
 
+pub fn runHeadlessProfile(allocator: std.mem.Allocator, options: DemoOptions) !void {
+    const log_path = options.profile_log orelse {
+        std.debug.print("Headless profile requires --profile-log <file>\n", .{});
+        return;
+    };
+    if (std.fs.path.dirname(log_path)) |dir| {
+        if (dir.len > 0) {
+            std.fs.cwd().makePath(dir) catch |err| {
+                std.debug.print("Failed to create profile directory '{s}': {any}\n", .{ dir, err });
+                return err;
+            };
+        }
+    }
+
+    var file = try std.fs.cwd().createFile(log_path, .{ .truncate = true });
+    defer file.close();
+    try file.writeAll(
+        "frame,frame_ms,loaded_chunks,visible_chunks,rendered_chunks,culled_chunks,budget_skipped,total_vertices,total_indices,lod_full,lod_medium,lod_far,regenerations,stream_last_ms,stream_avg_ms,stream_max_ms,queued_candidates,queued_generations,completed_async,immediate_loaded,unloaded,pending_generations\n",
+    );
+
+    const difficulty = options.world_difficulty orelse .normal;
+    const seed = options.world_seed orelse 0x4F4B4CF5ACED1234;
+    const view_distance = viewDistanceForDifficulty(difficulty);
+
+    var chunk_manager = try streaming.ChunkStreamingManager.init(allocator, seed, view_distance);
+    defer chunk_manager.deinit();
+    chunk_manager.max_chunks_per_frame = chunkBudgetForDifficulty(difficulty);
+    try chunk_manager.startAsyncGeneration();
+
+    const spawn_pos = math.Vec3.init(8.0, 75.0, 8.0);
+    var player_physics = player.PlayerPhysics.init(spawn_pos);
+    player_physics.is_flying = true;
+
+    var main_camera = camera.Camera.init(player_physics.getEyePosition(), 16.0 / 9.0);
+    main_camera.setMode(.free_cam);
+    main_camera.pitch = -0.3;
+    main_camera.updateVectors();
+
+    var mesher = mesh.GreedyMesher.init(allocator);
+    var mesh_cache = std.AutoHashMap(u64, CachedMesh).init(allocator);
+    defer {
+        var it = mesh_cache.iterator();
+        while (it.next()) |entry| {
+            if (entry.value_ptr.vertices.len > 0) allocator.free(entry.value_ptr.vertices);
+            if (entry.value_ptr.indices.len > 0) allocator.free(entry.value_ptr.indices);
+        }
+        mesh_cache.deinit();
+    }
+    var combined_vertices = std.ArrayListUnmanaged(metal_renderer.Vertex){};
+    defer combined_vertices.deinit(allocator);
+    var combined_indices = std.ArrayListUnmanaged(u32){};
+    defer combined_indices.deinit(allocator);
+
+    const expected_spawn_chunks = @as(u32, @intCast((view_distance * 2 + 1) * (view_distance * 2 + 1)));
+    const original_budget = chunk_manager.max_chunks_per_frame;
+    chunk_manager.max_chunks_per_frame = @max(original_budget, expected_spawn_chunks);
+    var warmup: usize = 0;
+    while (warmup < 240) : (warmup += 1) {
+        try chunk_manager.update(player_physics.position, main_camera.front);
+        std.Thread.sleep(std.time.ns_per_ms);
+        if (chunk_manager.getLoadedCount() >= expected_spawn_chunks) break;
+    }
+    chunk_manager.max_chunks_per_frame = original_budget;
+
+    // Prime mesh cache before recording frames
+    _ = try updateGpuMeshes(
+        allocator,
+        &chunk_manager,
+        &mesh_cache,
+        &mesher,
+        &combined_vertices,
+        &combined_indices,
+        main_camera.getFrustum(),
+        main_camera.getPosition(),
+        default_meshes_per_frame,
+    );
+
+    const profile_frames = if (options.profile_frames == 0) 600 else options.profile_frames;
+    std.debug.print("Headless profile writing {d} frames to {s}\n", .{ profile_frames, log_path });
+
+    var frame: u32 = 0;
+    while (frame < profile_frames) : (frame += 1) {
+        const frame_start = std.time.nanoTimestamp();
+        try chunk_manager.update(player_physics.position, main_camera.front);
+        std.Thread.sleep(std.time.ns_per_ms);
+        const mesh_stats = try updateGpuMeshes(
+            allocator,
+            &chunk_manager,
+            &mesh_cache,
+            &mesher,
+            &combined_vertices,
+            &combined_indices,
+            main_camera.getFrustum(),
+            main_camera.getPosition(),
+            default_meshes_per_frame,
+        );
+        const frame_end = std.time.nanoTimestamp();
+
+        const frame_ms = @as(f64, @floatFromInt(frame_end - frame_start)) / 1_000_000.0;
+        const streaming_stats = chunk_manager.profilingStats();
+        const last_ms = @as(f64, @floatFromInt(streaming_stats.last_update_ns)) / 1_000_000.0;
+        const avg_ms = streaming_stats.average_update_ns / 1_000_000.0;
+        const max_ms = @as(f64, @floatFromInt(streaming_stats.max_update_ns)) / 1_000_000.0;
+
+        var line_buffer: [512]u8 = undefined;
+        const line = try std.fmt.bufPrint(
+            &line_buffer,
+            "{d},{d:.3},{d},{d},{d},{d},{d},{d},{d},{d},{d},{d},{d},{d:.3},{d:.3},{d:.3},{d},{d},{d},{d},{d},{d}\n",
+            .{
+                frame,
+                frame_ms,
+                chunk_manager.getLoadedCount(),
+                mesh_stats.visible_chunks,
+                mesh_stats.rendered_chunks,
+                mesh_stats.culled_chunks,
+                mesh_stats.budget_skipped,
+                mesh_stats.total_vertices,
+                mesh_stats.total_indices,
+                mesh_stats.full_chunks,
+                mesh_stats.medium_chunks,
+                mesh_stats.far_chunks,
+                mesh_stats.regenerations,
+                last_ms,
+                avg_ms,
+                max_ms,
+                streaming_stats.queued_candidates,
+                streaming_stats.queued_generations,
+                streaming_stats.completed_async,
+                streaming_stats.immediate_loaded,
+                streaming_stats.unloaded,
+                streaming_stats.pending_generations,
+            },
+        );
+        try file.writeAll(line);
+    }
+
+    var summary_buf: [64]u8 = undefined;
+    const summary = try std.fmt.bufPrint(&summary_buf, "# completed {d} frames\n", .{profile_frames});
+    try file.writeAll(summary);
+    std.debug.print("Headless profile complete: {s}\n", .{log_path});
+}
+
 /// Console-based interactive demo (legacy)
 pub fn runConsoleDemo(allocator: std.mem.Allocator) !void {
     viz.clearScreen();
@@ -1253,6 +2205,14 @@ pub fn runConsoleDemo(allocator: std.mem.Allocator) !void {
     // Generate initial chunks
     std.debug.print("[World] Generating initial chunks...\n", .{});
     try chunk_manager.update(player_physics.position, main_camera.front);
+
+    // Warm up streaming so chunks load around the spawn before control is handed off.
+    var warmup: usize = 0;
+    while (warmup < 90) : (warmup += 1) {
+        try chunk_manager.update(player_physics.position, main_camera.front);
+        if (chunk_manager.getLoadedCount() >= @as(u32, @intCast((view_distance * 2 + 1) * (view_distance * 2 + 1)))) break;
+        std.Thread.sleep(1 * std.time.ns_per_ms);
+    }
     if (chunk_manager.takeAutosaveSummary()) |summary| {
         const duration_ms = @as(f64, @floatFromInt(summary.duration_ns)) / 1_000_000.0;
         const reason_str = switch (summary.reason) {
@@ -1441,6 +2401,7 @@ pub fn runInteractiveDemo(allocator: std.mem.Allocator, options: DemoOptions) !v
     var world_name_slice: []const u8 = options.world_name;
     var world_seed = options.world_seed;
     var force_new_world = options.force_new_world;
+    var requested_difficulty: ?persistence.Difficulty = options.world_difficulty;
 
     const should_prompt_world = options.world_seed == null and !options.force_new_world and std.mem.eql(u8, options.world_name, default_world_name);
 
@@ -1472,6 +2433,7 @@ pub fn runInteractiveDemo(allocator: std.mem.Allocator, options: DemoOptions) !v
             world_name_slice = owned_world_name.?;
             world_seed = selection.seed;
             force_new_world = selection.force_new;
+            requested_difficulty = selection.difficulty;
         } else {
             std.debug.print("Exiting without selecting a world.\n", .{});
             return;
@@ -1486,6 +2448,7 @@ pub fn runInteractiveDemo(allocator: std.mem.Allocator, options: DemoOptions) !v
         .seed = world_seed,
         .force_new = force_new_world,
         .worlds_root = options.worlds_root,
+        .description = options.world_description,
     }) catch |err| switch (err) {
         error.WorldAlreadyExists => {
             std.debug.print("Error: world '{s}' already exists. Use a different name or omit --new-world.\n", .{world_name_slice});
@@ -1510,9 +2473,23 @@ pub fn runInteractiveDemo(allocator: std.mem.Allocator, options: DemoOptions) !v
         world_persistence.deinit();
     }
 
-    std.debug.print("Loaded world '{s}' (seed {d})\n", .{ world_name_slice, world_persistence.seed() });
+    if (requested_difficulty) |diff_override| {
+        if (world_persistence.difficulty != diff_override) {
+            world_persistence.setDifficulty(diff_override);
+        }
+    }
 
-    const view_distance: i32 = 8;
+    const world_difficulty = world_persistence.difficulty;
+    const difficulty_label = persistence.difficultyLabel(world_difficulty);
+    std.debug.print("Loaded world '{s}' (seed {d}) | Difficulty: {s}\n", .{ world_name_slice, world_persistence.seed(), difficulty_label });
+    const world_description = world_persistence.description();
+    if (world_description.len > 0) {
+        std.debug.print("Description: {s}\n", .{world_description});
+    }
+
+    const view_distance: i32 = viewDistanceForDifficulty(world_difficulty);
+    std.debug.print("Chunk view distance set to {d} chunks for {s} difficulty.\n", .{ view_distance, difficulty_label });
+
     var chunk_manager = try streaming.ChunkStreamingManager.init(allocator, world_persistence.seed(), view_distance);
     defer chunk_manager.deinit();
 
@@ -1520,6 +2497,10 @@ pub fn runInteractiveDemo(allocator: std.mem.Allocator, options: DemoOptions) !v
     chunk_manager.world_persistence = &world_persistence;
     chunk_manager.syncPersistenceSettings();
     chunk_manager.resetAutosaveTimer();
+
+    const default_autosave_interval = autosaveIntervalForDifficulty(world_difficulty);
+    chunk_manager.setAutosaveIntervalSeconds(default_autosave_interval);
+    chunk_manager.max_chunks_per_frame = chunkBudgetForDifficulty(world_difficulty);
 
     var autosave_presets = std.ArrayListUnmanaged(u32){};
     defer autosave_presets.deinit(allocator);
@@ -1603,15 +2584,9 @@ pub fn runInteractiveDemo(allocator: std.mem.Allocator, options: DemoOptions) !v
     var fps_counter: u32 = 0;
     var fps_timer: f64 = 0;
     var autosave_elapsed: f32 = 0;
-    var autosave_status_timer: f32 = 0;
-    var autosave_status_msg: []const u8 = "";
-
-    const autosave_status_cap: usize = 128;
-    const autosave_status_buffer = try allocator.alloc(u8, autosave_status_cap);
-    defer allocator.free(autosave_status_buffer);
-
-    const manual_message_buffer = try allocator.alloc(u8, autosave_status_cap);
-    defer allocator.free(manual_message_buffer);
+    var hud_notifications = std.ArrayListUnmanaged(HudNotification){};
+    defer hud_notifications.deinit(allocator);
+    var hud_message_buffer: [128]u8 = undefined;
 
     std.debug.print("Controls:\n", .{});
     std.debug.print("  Movement: WASD, Space/Ctrl (fly up/down), Shift (sprint), F (toggle fly)\n", .{});
@@ -1622,6 +2597,16 @@ pub fn runInteractiveDemo(allocator: std.mem.Allocator, options: DemoOptions) !v
     std.debug.print("  ESC (unlock cursor), ESC again (quit)\n", .{});
 
     try chunk_manager.update(player_physics.position, main_camera.front);
+    const expected_spawn_chunks = @as(u32, @intCast((view_distance * 2 + 1) * (view_distance * 2 + 1)));
+    const original_chunk_budget = chunk_manager.max_chunks_per_frame;
+    chunk_manager.max_chunks_per_frame = @max(original_chunk_budget, expected_spawn_chunks);
+    var initial_warmup: usize = 0;
+    while (initial_warmup < 240) : (initial_warmup += 1) {
+        try chunk_manager.update(player_physics.position, main_camera.front);
+        if (chunk_manager.getLoadedCount() >= expected_spawn_chunks) break;
+        std.Thread.sleep(1 * std.time.ns_per_ms);
+    }
+    chunk_manager.max_chunks_per_frame = original_chunk_budget;
 
     var mesher = mesh.GreedyMesher.init(allocator);
 
@@ -1652,6 +2637,15 @@ pub fn runInteractiveDemo(allocator: std.mem.Allocator, options: DemoOptions) !v
 
     // Track selected block for outline rendering
     var selected_block: ?raycast.RaycastHit = null;
+    var frame_time_avg_ms: f32 = 6.0;
+    var mesh_regen_budget: usize = default_meshes_per_frame;
+    const mesh_regen_medium_ms: f32 = 8.0;
+    const mesh_regen_high_ms: f32 = 10.0;
+
+    if (options.scenario != .none) {
+        try runScenario(allocator, options, &metal_ctx, &chunk_manager, &player_physics, &main_camera, model_matrix, &mesher, &mesh_cache, &combined_vertices, &combined_indices);
+        return;
+    }
 
     while (!window.should_close) {
         input_state.beginFrame();
@@ -1690,9 +2684,8 @@ pub fn runInteractiveDemo(allocator: std.mem.Allocator, options: DemoOptions) !v
             const msg = if (chunk_manager.autosaveIntervalSeconds() == 0)
                 "Autosave: off"
             else
-                std.fmt.bufPrint(autosave_status_buffer, "Autosave: every {d}s", .{chunk_manager.autosaveIntervalSeconds()}) catch "Autosave interval set";
-            autosave_status_msg = msg;
-            autosave_status_timer = 4.0;
+                std.fmt.bufPrint(&hud_message_buffer, "Autosave: every {d}s", .{chunk_manager.autosaveIntervalSeconds()}) catch "Autosave interval set";
+            pushHudNotification(&hud_notifications, allocator, msg, 4.0);
         }
 
         if (input_state.wasKeyPressed(.f6)) {
@@ -1702,13 +2695,11 @@ pub fn runInteractiveDemo(allocator: std.mem.Allocator, options: DemoOptions) !v
                     "[Autosave] Manual save: saved {d} chunks ({d} errors) in {d:.2} ms\n",
                     .{ summary.saved_chunks, summary.errors, duration_ms },
                 );
-                const msg = std.fmt.bufPrint(manual_message_buffer, "Manual save: {d} chunks ({d} errors)", .{ summary.saved_chunks, summary.errors }) catch "Manual save";
-                autosave_status_msg = msg;
-                autosave_status_timer = 4.0;
+                const msg = std.fmt.bufPrint(&hud_message_buffer, "Manual save: {d} chunks ({d} errors)", .{ summary.saved_chunks, summary.errors }) catch "Manual save";
+                pushHudNotification(&hud_notifications, allocator, msg, 4.0);
             } else {
                 std.debug.print("[Autosave] Manual save: no modified chunks\n", .{});
-                autosave_status_msg = "Manual save: no changes";
-                autosave_status_timer = 4.0;
+                pushHudNotification(&hud_notifications, allocator, "Manual save: no changes", 4.0);
             }
             autosave_elapsed = 0;
         }
@@ -1721,8 +2712,8 @@ pub fn runInteractiveDemo(allocator: std.mem.Allocator, options: DemoOptions) !v
                 const retention = backup_retention_presets.items[backup_retention_index];
                 chunk_manager.setBackupRetention(retention);
                 std.debug.print("Backups retention set to {d} copies per region.\n", .{retention});
-                autosave_status_msg = std.fmt.bufPrint(autosave_status_buffer, "Backups: keep {d}", .{retention}) catch "Backups retention set";
-                autosave_status_timer = 4.0;
+                const msg = std.fmt.bufPrint(&hud_message_buffer, "Backups: keep {d}", .{retention}) catch "Backups retention set";
+                pushHudNotification(&hud_notifications, allocator, msg, 4.0);
             } else {
                 std.debug.print("Backups retention control unavailable: no persistence backend.\n", .{});
             }
@@ -1734,8 +2725,21 @@ pub fn runInteractiveDemo(allocator: std.mem.Allocator, options: DemoOptions) !v
                 const retention = backup_retention_presets.items[backup_retention_index];
                 chunk_manager.setBackupRetention(retention);
                 std.debug.print("Backups retention set to {d} copies per region.\n", .{retention});
-                autosave_status_msg = std.fmt.bufPrint(autosave_status_buffer, "Backups: keep {d}", .{retention}) catch "Backups retention set";
-                autosave_status_timer = 4.0;
+                const msg = std.fmt.bufPrint(&hud_message_buffer, "Backups: keep {d}", .{retention}) catch "Backups retention set";
+                pushHudNotification(&hud_notifications, allocator, msg, 4.0);
+            }
+        } else if (input_state.wasKeyPressed(.f11)) {
+            const queued = chunk_manager.queueLoadedRegionBackups();
+            if (queued) {
+                pushHudNotification(&hud_notifications, allocator, "Backups: queued region compaction", 4.0);
+            } else {
+                const remaining = chunk_manager.backupCooldownSecondsRemaining();
+                var cooldown_buf: [96]u8 = undefined;
+                const msg = if (remaining > 0)
+                    std.fmt.bufPrint(&cooldown_buf, "Backups cooling ~{d}s", .{remaining}) catch "Backups cooling"
+                else
+                    "Backups: no regions";
+                pushHudNotification(&hud_notifications, allocator, msg, 3.0);
             }
         }
 
@@ -1749,16 +2753,21 @@ pub fn runInteractiveDemo(allocator: std.mem.Allocator, options: DemoOptions) !v
         const delta_seconds = @as(f64, @floatFromInt(delta_ns)) / 1_000_000_000.0;
         accumulator += delta_seconds;
         fps_timer += delta_seconds;
-        autosave_elapsed += @as(f32, @floatCast(delta_seconds));
-        if (autosave_status_timer > 0) {
-            autosave_status_timer -= @as(f32, @floatCast(delta_seconds));
-            if (autosave_status_timer <= 0) {
-                autosave_status_timer = 0;
-                autosave_status_msg = "";
-            }
+        const delta_seconds_f32: f32 = @as(f32, @floatCast(delta_seconds));
+        autosave_elapsed += delta_seconds_f32;
+        updateHudNotifications(&hud_notifications, delta_seconds_f32);
+
+        const frame_ms = delta_seconds_f32 * 1000.0;
+        frame_time_avg_ms = frame_time_avg_ms * 0.85 + frame_ms * 0.15;
+        if (frame_ms > mesh_regen_high_ms or frame_time_avg_ms > mesh_regen_high_ms) {
+            mesh_regen_budget = 1;
+        } else if (frame_ms > mesh_regen_medium_ms or frame_time_avg_ms > mesh_regen_medium_ms) {
+            mesh_regen_budget = 2;
+        } else {
+            mesh_regen_budget = default_meshes_per_frame;
         }
 
-        time_of_day += @as(f32, @floatCast(delta_seconds)) / day_length_seconds;
+        time_of_day += delta_seconds_f32 / day_length_seconds;
         if (time_of_day >= 1.0) time_of_day -= 1.0;
 
         if (window.height != 0) {
@@ -1766,7 +2775,15 @@ pub fn runInteractiveDemo(allocator: std.mem.Allocator, options: DemoOptions) !v
             main_camera.setAspectRatio(aspect);
         }
 
-        main_camera.processMouseMovement(input_state.mouse_delta.x, input_state.mouse_delta.y);
+        if (window.cursor_locked) {
+            main_camera.processMouseMovement(input_state.mouse_delta.x, input_state.mouse_delta.y);
+        } else {
+            input_state.mouse_delta = math.Vec2.zero();
+            if (input_state.wasMousePressed(.left) or input_state.wasMousePressed(.right)) {
+                window.setCursorLocked(true);
+                input_state.mouse_delta = math.Vec2.zero();
+            }
+        }
 
         // Block interaction - ray cast from camera
         const GetBlockFn = struct {
@@ -1880,9 +2897,19 @@ pub fn runInteractiveDemo(allocator: std.mem.Allocator, options: DemoOptions) !v
                     "[Autosave] Saved {d} chunks ({d} errors) in {d:.2} ms ({s})\n",
                     .{ summary.saved_chunks, summary.errors, duration_ms, reason_str },
                 );
-                autosave_status_msg = std.fmt.bufPrint(autosave_status_buffer, "Autosave: {d} chunks ({d} errors)", .{ summary.saved_chunks, summary.errors }) catch "Autosave complete";
-                autosave_status_timer = 4.0;
+                const msg = std.fmt.bufPrint(&hud_message_buffer, "Autosave: {d} chunks ({d} errors)", .{ summary.saved_chunks, summary.errors }) catch "Autosave complete";
+                pushHudNotification(&hud_notifications, allocator, msg, 4.0);
                 autosave_elapsed = 0;
+            }
+
+            if (chunk_manager.takeScheduledBackupNotice()) {
+                const cooldown = chunk_manager.backupCooldownSecondsRemaining();
+                const notice = if (cooldown > 0)
+                    std.fmt.bufPrint(&hud_message_buffer, "Maintenance queued (~{d}s cooldown)", .{cooldown}) catch "Maintenance queued"
+                else
+                    "Maintenance queued";
+                pushHudNotification(&hud_notifications, allocator, notice, 4.0);
+                std.debug.print("[Maintenance] Queued region compaction batch (cooldown ~{d}s).\n", .{cooldown});
             }
 
             accumulator -= fixed_dt_seconds;
@@ -1895,11 +2922,11 @@ pub fn runInteractiveDemo(allocator: std.mem.Allocator, options: DemoOptions) !v
         const frustum = math.Frustum.fromMatrix(view_proj);
 
         const camera_pos = main_camera.getPosition();
-        const mesh_stats = try updateGpuMeshes(allocator, &chunk_manager, &mesh_cache, &mesher, &combined_vertices, &combined_indices, frustum, camera_pos);
+        const mesh_stats = try updateGpuMeshes(allocator, &chunk_manager, &mesh_cache, &mesher, &combined_vertices, &combined_indices, frustum, camera_pos, mesh_regen_budget);
         const has_mesh = combined_vertices.items.len > 0;
 
         if (selected_block) |sel| {
-            const outline_vertices = try generateCubeOutlineVertices(allocator, sel.block_pos, 0.01);
+            const outline_vertices = try generateCubeOutlineVertices(allocator, sel.block_pos, 0.02);
             defer allocator.free(outline_vertices);
             if (outline_vertices.len > 0) {
                 const outline_bytes = std.mem.sliceAsBytes(outline_vertices);
@@ -1913,12 +2940,17 @@ pub fn runInteractiveDemo(allocator: std.mem.Allocator, options: DemoOptions) !v
 
         if (has_mesh) {
             hud_vertices.clearRetainingCapacity();
-            var hud_texts: [4][]const u8 = .{ "", "", "", "" };
+            var hud_texts: [16][]const u8 = .{ "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "" };
             var hud_count: usize = 0;
             var max_width: f32 = 0;
-            const hud_scale: f32 = 16.0;
+            const base_hud_scale: f32 = 2.0;
+            const height_factor: f32 = if (window.height > 0)
+                std.math.clamp(@as(f32, @floatFromInt(window.height)) / 720.0, 0.75, 1.5)
+            else
+                1.0;
+            const hud_scale: f32 = base_hud_scale * height_factor;
             const hud_line_height = line_text.lineHeightPx(hud_scale);
-            const hud_padding = 12.0;
+            const hud_padding = 8.0 + hud_scale * 2.0;
 
             var countdown_buf: [48]u8 = undefined;
             const autosave_interval = chunk_manager.autosaveIntervalSeconds();
@@ -1933,10 +2965,87 @@ pub fn runInteractiveDemo(allocator: std.mem.Allocator, options: DemoOptions) !v
             hud_count += 1;
             max_width = line_text.textWidth(autosave_line, hud_scale);
 
-            if (autosave_status_msg.len > 0) {
-                hud_texts[hud_count] = autosave_status_msg;
+            var chunk_buf: [96]u8 = undefined;
+            const chunk_line = std.fmt.bufPrint(
+                &chunk_buf,
+                "Chunks {d}/{d} | Culled {d} | Budget {d}",
+                .{ mesh_stats.rendered_chunks, mesh_stats.total_chunks, mesh_stats.culled_chunks, mesh_stats.budget_skipped },
+            ) catch "Chunk stats";
+            hud_texts[hud_count] = chunk_line;
+            hud_count += 1;
+            max_width = @max(max_width, line_text.textWidth(chunk_line, hud_scale));
+
+            var geom_buf: [96]u8 = undefined;
+            const geom_line = std.fmt.bufPrint(
+                &geom_buf,
+                "Verts {d} | Tris {d}",
+                .{ mesh_stats.total_vertices, mesh_stats.total_indices / 3 },
+            ) catch "Geometry stats";
+            hud_texts[hud_count] = geom_line;
+            hud_count += 1;
+            max_width = @max(max_width, line_text.textWidth(geom_line, hud_scale));
+
+            var lod_buf: [96]u8 = undefined;
+            const lod_line = std.fmt.bufPrint(
+                &lod_buf,
+                "LOD full {d} mid {d} far {d} regen {d}",
+                .{ mesh_stats.full_chunks, mesh_stats.medium_chunks, mesh_stats.far_chunks, mesh_stats.regenerations },
+            ) catch "LOD stats";
+            hud_texts[hud_count] = lod_line;
+            hud_count += 1;
+            max_width = @max(max_width, line_text.textWidth(lod_line, hud_scale));
+
+            const streaming_stats = chunk_manager.profilingStats();
+            const last_ms = @as(f32, @floatFromInt(streaming_stats.last_update_ns)) / 1_000_000.0;
+            const avg_ms = @as(f32, @floatCast(streaming_stats.average_update_ns / 1_000_000.0));
+            const max_ms = @as(f32, @floatFromInt(streaming_stats.max_update_ns)) / 1_000_000.0;
+
+            var stream_time_buf: [128]u8 = undefined;
+            const stream_time_line = std.fmt.bufPrint(
+                &stream_time_buf,
+                "Stream {d:.2}ms avg {d:.2} max {d:.2} | pending {d}",
+                .{ last_ms, avg_ms, max_ms, streaming_stats.pending_generations },
+            ) catch "Stream timing";
+            hud_texts[hud_count] = stream_time_line;
+            hud_count += 1;
+            max_width = @max(max_width, line_text.textWidth(stream_time_line, hud_scale));
+
+            var stream_queue_buf: [128]u8 = undefined;
+            const stream_queue_line = std.fmt.bufPrint(
+                &stream_queue_buf,
+                "Queue {d} gen {d} async {d} load {d} unld {d}",
+                .{
+                    streaming_stats.queued_candidates,
+                    streaming_stats.queued_generations,
+                    streaming_stats.completed_async,
+                    streaming_stats.immediate_loaded,
+                    streaming_stats.unloaded,
+                },
+            ) catch "Stream queue";
+            hud_texts[hud_count] = stream_queue_line;
+            hud_count += 1;
+            max_width = @max(max_width, line_text.textWidth(stream_queue_line, hud_scale));
+
+            for (hud_notifications.items) |notif| {
+                if (hud_count >= hud_texts.len) break;
+                if (notif.len == 0) continue;
+                const notif_text = notif.text[0..notif.len];
+                hud_texts[hud_count] = notif_text;
                 hud_count += 1;
-                max_width = @max(max_width, line_text.textWidth(autosave_status_msg, hud_scale));
+                max_width = @max(max_width, line_text.textWidth(notif_text, hud_scale));
+            }
+
+            if (chunk_manager.world_persistence) |wp| {
+                const backup_status = wp.backupStatus();
+                var maint_buf: [96]u8 = undefined;
+                const maint_line = std.fmt.bufPrint(
+                    &maint_buf,
+                    "Backup queued {d} retained {d}/{d}",
+                    .{ wp.queuedCompactions(), backup_status.retained, backup_status.retention_limit },
+                ) catch "Backup stats";
+                hud_texts[hud_count] = maint_line;
+                hud_count += 1;
+                max_width = @max(max_width, line_text.textWidth(maint_line, hud_scale));
             }
 
             if (chunk_manager.world_persistence) |wp| {
@@ -2086,8 +3195,11 @@ pub fn runInteractiveDemo(allocator: std.mem.Allocator, options: DemoOptions) !v
                 const remaining = @max(0.0, @as(f32, @floatFromInt(autosave_interval_console)) - autosave_elapsed);
                 std.debug.print("Autosave: next in ~{d:.1}s\n", .{remaining});
             }
-            if (autosave_status_msg.len > 0) {
-                std.debug.print("Autosave status: {s}\n", .{autosave_status_msg});
+            if (hud_notifications.items.len > 0) {
+                const latest = hud_notifications.items[hud_notifications.items.len - 1];
+                if (latest.len > 0) {
+                    std.debug.print("HUD notice: {s}\n", .{latest.text[0..latest.len]});
+                }
             }
             if (chunk_manager.world_persistence) |wp| {
                 const backup_status = wp.backupStatus();

@@ -38,6 +38,7 @@ extern fn metal_set_ui_mesh(ctx: *anyopaque, vertices: *const anyopaque, vertex_
 extern fn metal_set_texture(ctx: *anyopaque, data: [*]const u8, width: usize, height: usize, bytes_per_row: usize) bool;
 extern fn metal_set_performance_hud(ctx: *anyopaque, enabled: bool) void;
 extern fn metal_set_render_mode(ctx: *anyopaque, mode: i32) void;
+extern fn metal_request_capture(ctx: *anyopaque, path: [*]const u8, path_len: usize) bool;
 
 pub const RenderMode = enum(i32) {
     normal = 0,
@@ -154,6 +155,13 @@ pub const MetalContext = struct {
     pub fn draw(self: *MetalContext, clear_color: [4]f32) !void {
         if (!metal_draw(self.ctx, &clear_color[0])) {
             return error.DrawFailed;
+        }
+    }
+
+    pub fn requestCapture(self: *MetalContext, path: []const u8) !void {
+        if (path.len == 0) return error.InvalidCapturePath;
+        if (!metal_request_capture(self.ctx, path.ptr, path.len)) {
+            return error.CaptureRequestFailed;
         }
     }
 

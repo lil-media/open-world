@@ -3,6 +3,7 @@ const math = @import("../utils/math.zig");
 
 pub const max_keys = 512;
 pub const max_mouse_buttons = 8;
+pub const max_text_input = 64;
 
 /// Common keyboard keys mapped to SDL scancodes for convenience.
 pub const Key = enum(u16) {
@@ -17,6 +18,9 @@ pub const Key = enum(u16) {
     e = 8,
     r = 21,
     f = 9,
+    f1 = 58,
+    f2 = 59,
+    f3 = 60,
     f4 = 61,
     f5 = 62,
     f6 = 63,
@@ -62,6 +66,8 @@ pub const InputState = struct {
     mouse_position: math.Vec2 = math.Vec2.zero(),
     mouse_delta: math.Vec2 = math.Vec2.zero(),
     scroll_delta: math.Vec2 = math.Vec2.zero(),
+    text_input: [max_text_input]u8 = [_]u8{0} ** max_text_input,
+    text_input_len: usize = 0,
 
     /// Reset transient per-frame values (call once at frame begin).
     pub fn beginFrame(self: *InputState) void {
@@ -71,6 +77,7 @@ pub const InputState = struct {
         @memset(self.mouse_released[0..], false);
         self.mouse_delta = math.Vec2.zero();
         self.scroll_delta = math.Vec2.zero();
+        self.text_input_len = 0;
     }
 
     /// Update key state from a scancode event.
@@ -121,6 +128,22 @@ pub const InputState = struct {
     /// Update scroll wheel delta.
     pub fn handleMouseWheel(self: *InputState, delta_x: f32, delta_y: f32) void {
         self.scroll_delta = self.scroll_delta.add(math.Vec2.init(delta_x, delta_y));
+    }
+
+    /// Append UTF-8 text input captured this frame.
+    pub fn handleTextInput(self: *InputState, text: []const u8) void {
+        for (text) |ch| {
+            if (self.text_input_len >= max_text_input) break;
+            self.text_input[self.text_input_len] = ch;
+            self.text_input_len += 1;
+        }
+    }
+
+    /// Consume accumulated text input (resets the buffer).
+    pub fn takeTextInput(self: *InputState) []const u8 {
+        const slice = self.text_input[0..self.text_input_len];
+        self.text_input_len = 0;
+        return slice;
     }
 
     /// Check if a key is currently held down.

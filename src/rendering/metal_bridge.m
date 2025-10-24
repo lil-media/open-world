@@ -5,6 +5,8 @@
 #import <CoreFoundation/CoreFoundation.h>
 #import <string.h>
 #import <stdint.h>
+#import <CoreGraphics/CoreGraphics.h>
+#include <stdlib.h>
 
 // Simple C API for Metal rendering from Zig
 typedef enum {
@@ -34,6 +36,9 @@ typedef struct {
     size_t ui_vertex_count;
     size_t ui_vertex_stride;
     RenderMode render_mode;
+    char* capture_path;
+    size_t capture_path_len;
+    bool capture_pending;
 } MetalContext;
 
 MetalContext* metal_create_context(void* sdl_metal_view) {
@@ -87,6 +92,9 @@ MetalContext* metal_create_context(void* sdl_metal_view) {
     ctx->ui_vertex_count = 0;
     ctx->ui_vertex_stride = 0;
     ctx->render_mode = RenderModeNormal;
+    ctx->capture_path = NULL;
+    ctx->capture_path_len = 0;
+    ctx->capture_pending = false;
 
     return ctx;
 }
@@ -107,6 +115,7 @@ void metal_destroy_context(MetalContext* ctx) {
         if (ctx->device) CFRelease(ctx->device);
         if (ctx->queue) CFRelease(ctx->queue);
         if (ctx->layer) CFRelease(ctx->layer);
+        if (ctx->capture_path) free(ctx->capture_path);
         free(ctx);
     }
 }
@@ -116,6 +125,67 @@ static void metal_release_and_assign(void** target, void* new_value) {
         CFRelease(*target);
     }
     *target = new_value;
+}
+
+static bool metal_save_texture_png(id<MTLTexture> texture, NSString* path) {
+    if (!texture || !path) return false;
+
+    @autoreleasepool {
+        const NSUInteger width = texture.width;
+        const NSUInteger height = texture.height;
+        const NSUInteger bytesPerRow = width * 4;
+        const size_t dataSize = bytesPerRow * height;
+        uint8_t* data = malloc(dataSize);
+        if (!data) {
+            return false;
+        }
+
+        MTLRegion region = MTLRegionMake2D(0, 0, width, height);
+        [texture getBytes:data bytesPerRow:bytesPerRow fromRegion:region mipmapLevel:0];
+
+        CGColorSpaceRef colorSpace = CGColorSpaceCreateDeviceRGB();
+        if (!colorSpace) {
+            free(data);
+            return false;
+        }
+
+        CGContextRef context = CGBitmapContextCreate(
+            data,
+            width,
+            height,
+            8,
+            bytesPerRow,
+            colorSpace,
+            kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little);
+
+        CGColorSpaceRelease(colorSpace);
+
+        if (!context) {
+            free(data);
+            return false;
+        }
+
+        CGImageRef image = CGBitmapContextCreateImage(context);
+        CGContextRelease(context);
+        free(data);
+
+        if (!image) {
+            return false;
+        }
+
+        NSBitmapImageRep* rep = [[NSBitmapImageRep alloc] initWithCGImage:image];
+        CGImageRelease(image);
+        if (!rep) {
+            return false;
+        }
+
+        NSData* pngData = [rep representationUsingType:NSBitmapImageFileTypePNG properties:@{}];
+        if (!pngData) {
+            return false;
+        }
+
+        return [pngData writeToFile:path atomically:YES];
+    }
 }
 
 bool metal_create_pipeline(MetalContext* ctx, const char* source, size_t source_length, const char* vertex_name, size_t vertex_length, const char* fragment_name, size_t fragment_length, size_t vertex_stride) {
@@ -469,10 +539,52 @@ bool metal_draw(MetalContext* ctx, const float* clear_color) {
     [commandBuffer presentDrawable:drawable];
     [commandBuffer commit];
 
+    if (ctx->capture_pending && ctx->capture_path && ctx->capture_path_len > 0) {
+        [commandBuffer waitUntilCompleted];
+        NSString* pathString = [[NSString alloc] initWithBytes:ctx->capture_path length:ctx->capture_path_len encoding:NSUTF8StringEncoding];
+        if (!pathString) {
+            NSLog(@"Failed to decode screenshot path");
+        } else {
+            id<MTLTexture> captureTexture = drawable.texture;
+            if (!metal_save_texture_png(captureTexture, pathString)) {
+                NSLog(@"Failed to save screenshot to %@", pathString);
+            }
+        }
+        free(ctx->capture_path);
+        ctx->capture_path = NULL;
+        ctx->capture_path_len = 0;
+        ctx->capture_pending = false;
+    }
+
     return true;
 }
 
 
+
+
+bool metal_request_capture(MetalContext* ctx, const char* path, size_t path_length) {
+    if (!ctx || !path || path_length == 0) return false;
+
+    char* copy = malloc(path_length);
+    if (!copy) return false;
+
+    memcpy(copy, path, path_length);
+
+    if (ctx->capture_path) {
+        free(ctx->capture_path);
+    }
+
+    ctx->capture_path = copy;
+    ctx->capture_path_len = path_length;
+    ctx->capture_pending = true;
+
+    if (ctx->layer) {
+        CAMetalLayer* layer = (__bridge CAMetalLayer*)ctx->layer;
+        layer.framebufferOnly = NO;
+    }
+
+    return true;
+}
 
 
 bool metal_render_frame(MetalContext* ctx, float r, float g, float b) {

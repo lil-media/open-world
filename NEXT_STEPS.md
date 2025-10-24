@@ -1,346 +1,112 @@
-# Next Steps: Metal Rendering Integration
+# Phase 1 Optimization & Persistence Execution Plan
 
-## Current Status ✅
-
-**Phase 1 Foundation: 60% Complete**
-
-All core systems are working:
-- ✅ Terrain generation (8 biomes, caves)
-- ✅ Chunk streaming (76 chunks in demo)
-- ✅ Player physics (movement, collision)
-- ✅ Camera system (first-person, free-cam)
-- ✅ Greedy meshing (optimized rendering)
-- ✅ Math utilities (Vec3, AABB, Mat4, Frustum)
-
-**Demo Output:**
-```bash
-$ zig build run
-# Loads 76 chunks, simulates 180 frames, shows biome distribution
-```
+This plan translates the roadmap “In Progress” and “Next Up” buckets into actionable steps so we can close out Phase 1 and stage the next phase.
 
 ---
 
-## Immediate Next Steps (Week 3)
+## 1. Performance Profiling & Optimization *(roadmap: In Progress)*
 
-### Option A: Quick Wins (Recommended Start)
+**Objective:** Capture real metrics for chunk streaming, LOD budgets, and frame timings so tuning is evidence-driven.
 
-Before diving into Metal, solidify what we have:
-
-#### 1. Enhanced Demo (1-2 days)
-- [ ] Add more biome variety to demo output
-- [ ] Show chunk mesh statistics (vertices, triangles)
-- [ ] Display memory usage tracking
-- [ ] Add FPS counter simulation
-- [ ] Visualize chunk loading pattern
-
-**Why:** Validates current systems, provides baseline metrics
-
-#### 2. Input System Foundation (1 day)
-```zig
-// src/platform/input.zig
-pub const Input = struct {
-    keys: [512]bool,
-    mouse_delta: Vec2,
-    mouse_buttons: [8]bool,
-
-    pub fn isKeyPressed(self: Input, key: Key) bool;
-    pub fn getMouseDelta(self: Input) Vec2;
-};
-```
-
-**Why:** Needed for player controls regardless of rendering
-
-#### 3. Game State Manager (1 day)
-```zig
-// src/game/state.zig
-pub const GameState = struct {
-    world: *ChunkStreamingManager,
-    player: *PlayerPhysics,
-    camera: *Camera,
-    paused: bool,
-    debug_mode: bool,
-};
-```
-
-**Why:** Organizes systems for easier Metal integration
-
-### Option B: Metal Integration (Week 3-4)
-
-**Prerequisites:**
-- macOS 12.0+
-- Xcode Command Line Tools
-- Zig 0.15.1
-
-#### Phase 1: Window & Context (3-4 days)
-
-**Approach 1: SDL2 (Simpler)**
-```bash
-# Add SDL2 via Homebrew
-brew install sdl2
-
-# Or bundle with zig-gamedev
-```
-
-Benefits:
-- Simple cross-platform windowing
-- Metal view creation helper
-- Input handling included
-- Many examples available
-
-**Approach 2: Mach Engine (More features)**
-```bash
-# Add to build.zig.zon (uncomment dependencies)
-# Mach handles everything: window, input, Metal setup
-```
-
-Benefits:
-- Integrated solution
-- WebGPU abstraction
-- Cross-platform from day one
-- Active development
-
-**Approach 3: Native macOS (Maximum control)**
-```zig
-// Direct Cocoa/AppKit integration
-// More complex but full Metal access
-```
-
-Benefits:
-- Zero dependencies
-- Full Apple Silicon optimization
-- Direct Metal 4 features
-- Maximum performance
-
-**Recommendation:** Start with **SDL2** for rapid prototyping, then add **Mach** later for cross-platform.
-
-#### Phase 2: First Triangle (2-3 days)
-
-Goal: Render a single colored triangle
-
-```zig
-// Minimal rendering pipeline:
-1. Create Metal device
-2. Create command queue
-3. Compile simple shader
-4. Create render pipeline
-5. Draw triangle in render loop
-```
-
-Success criteria:
-- Window opens
-- Triangle renders
-- 60 FPS achieved
-- No memory leaks
-
-#### Phase 3: Camera Integration (2 days)
-
-```zig
-// Use existing Camera system
-const view_proj = camera.getViewProjectionMatrix();
-
-// Upload to GPU as uniform buffer
-device.makeBuffer(bytes: &view_proj, options: .storageModeShared);
-```
-
-#### Phase 4: Chunk Rendering (3-4 days)
-
-```zig
-// For each loaded chunk:
-1. Generate mesh (existing greedy mesher)
-2. Upload vertices to GPU buffer
-3. Upload indices to GPU buffer
-4. Draw with view-projection matrix
-```
+- **Instrumentation**
+  - HUD lines in `src/demo.zig` already emit chunk counts, vertex/triangle totals, LOD tiers, and streaming timings.
+  - `ChunkStreamingManager.profilingStats()` exposes avg/max update times plus queue depths.
+  - Metal Performance HUD available via `MTL_HUD_ENABLED=1`.
+- **Capture loop**
+  1. Build latest code: `zig build render -Dskip-run=true`.
+  2. Run the headless profiler to capture CSV metrics: `ZIG_GLOBAL_CACHE_DIR=zig-global-cache ./zig-out/bin/render-demo --profile-log docs/perf/<name>.csv --profile-frames 300`.
+  3. Optionally, capture visual sweeps via `--scenario lod-sweep --scenario-settle 180` when a display is available.
+  3. Every ~10 s record HUD metrics + Metal HUD screenshots; dump to `docs/perf/baseline-YYYYMMDD.csv`.
+  4. Note spikes (budget skipped, streaming avg >6 ms, etc.) with context (camera position, view distance).
+- **Follow-up**
+  - Adjust `max_chunks_per_frame`, LOD radii, or async queue sizes based on bottlenecks.
+  - Re-run captures after each tuning round and archive deltas.
 
 ---
 
-## Metal Integration Checklist
+## 2. Chunk Persistence Polish *(roadmap: In Progress)*
 
-### Week 3: Foundation
-- [ ] Choose rendering library (SDL2 vs Mach vs Native)
-- [ ] Create window with Metal view
-- [ ] Initialize Metal device and command queue
-- [ ] Compile and load simple shader
-- [ ] Render colored triangle
-- [ ] Add FPS counter
-- [ ] Profile memory usage
+**Objective:** Make autosave/backup workflows hands-off and transparent.
 
-### Week 4: Chunk Rendering
-- [ ] Upload chunk mesh to GPU
-- [ ] Integrate existing camera matrices
-- [ ] Render single chunk
-- [ ] Render multiple chunks (4-16)
-- [ ] Add simple directional lighting
-- [ ] Implement basic frustum culling
-- [ ] Reach 60 FPS with 16 chunks
-
-### Week 5: Optimization
-- [ ] Implement full frustum culling
-- [ ] Add LOD system (4 tiers)
-- [ ] Batch chunk rendering
-- [ ] Add texture atlas
-- [ ] Optimize shader
-- [ ] Profile with Instruments
-- [ ] Reach 60 FPS with 64+ chunks
+- **Autosave-triggered compaction**
+  - After `forceAutosave()` success, enqueue `queueLoadedRegionBackups()` if cooldown permits.
+  - Surface queue status in HUD + console.
+- **Settings UI**
+  - Extend world-management menu with autosave interval picker, backup retention slider, and last-run timestamps.
+  - Persist selections per world.
+- **Scheduled compaction**
+  - Add timer-based enqueue (e.g., every 20 min of play) so long sessions get periodic maintenance.
+  - Ensure requests coalesce and respect cooldowns.
+- **Docs & roadmap**
+  - Summarize behaviour in new `docs/persistence.md`.
+  - Move checklist items to “Completed” once shipped.
 
 ---
 
-## Code Structure for Metal Integration
+## 3. Test Coverage for LOD & Persistence *(roadmap: In Progress)*
 
-```
-src/
-├── main.zig                    # Updated with render loop
-├── platform/
-│   ├── window.zig              # NEW: Window creation
-│   ├── input.zig               # NEW: Input handling
-│   └── metal_context.zig       # NEW: Metal setup
-├── rendering/
-│   ├── pipeline.zig            # NEW: Render pipeline
-│   ├── chunk_renderer.zig      # NEW: Chunk → GPU
-│   ├── camera.zig              # EXISTING: Already done
-│   ├── mesh.zig                # EXISTING: Already done
-│   └── shaders/
-│       ├── terrain.metal       # NEW: Vertex/fragment shaders
-│       └── common.metal        # NEW: Shared functions
-├── game/
-│   ├── state.zig               # NEW: Game state manager
-│   └── update.zig              # NEW: Game loop logic
-└── ... existing systems ...
-```
+**Objective:** Lock regressions before expanding features.
+
+- **LOD scheduler tests**
+  - Drive scheduler with synthetic camera positions verifying hysteresis and tier thresholds.
+  - Assert counts for near/mid/far buckets.
+- **Persistence workflow tests**
+  - Integration test: generate chunks → autosave → backup enqueue → reload and verify data integrity.
+  - Mock filesystem via temp directories to keep CI clean.
+- **Test harness**
+  - Add `tests/streaming.zig` (or similar) and wire into `zig build test`.
 
 ---
 
-## Alternative: Text-Based Rendering First
+## 4. Multi-Block Selection & Copy/Paste *(roadmap: Next Up)*
 
-**Before Metal, validate with terminal output:**
+**Objective:** Introduce creative tooling without breaking single-block flow.
 
-```zig
-// Create ASCII mini-map of loaded chunks
-pub fn renderTextMap(manager: *ChunkStreamingManager, player_pos: Vec3) void {
-    const player_chunk = ChunkPos.fromWorldPos(
-        @intFromFloat(player_pos.x),
-        @intFromFloat(player_pos.z),
-    );
-
-    // Print 20x20 grid
-    for (-10..10) |dz| {
-        for (-10..10) |dx| {
-            const pos = ChunkPos.init(
-                player_chunk.x + @as(i32, @intCast(dx)),
-                player_chunk.z + @as(i32, @intCast(dz)),
-            );
-
-            if (dx == 0 and dz == 0) {
-                print("@", .{}); // Player
-            } else if (manager.getChunk(pos) != null) {
-                print("█", .{}); // Loaded chunk
-            } else {
-                print("·", .{}); // Unloaded
-            }
-        }
-        print("\n", .{});
-    }
-}
-```
-
-**Benefits:**
-- Visualizes chunk loading immediately
-- No graphics dependencies
-- Easy to debug
-- Can run in CI/tests
+- Design selection data structure (min/max corners + block palette).
+- Prototype input binding (e.g., hold `Shift` to start selection, drag span).
+- Render selection volume via existing line mesh system.
+- Implement clipboard apply/rotate; start as in-memory only.
+- After playtesting, expose in UI with clear affordances.
 
 ---
 
-## Recommended Path Forward
+## 5. Automated Backup Scheduling & Incremental Snapshots *(roadmap: Next Up)*
 
-### Week 3: Prepare for Graphics
+**Objective:** Give worlds restore points even when players forget.
 
-**Day 1-2: Enhanced Demo**
-- Add text-based chunk visualization
-- Show mesh statistics
-- Memory profiling
-- Benchmark terrain generation
-
-**Day 3-4: Input & State**
-- Create Input system stub
-- Game state manager
-- Update loop refactoring
-
-**Day 5-7: Metal Setup**
-- Choose library (SDL2 recommended)
-- Create window
-- First triangle
-- FPS counter
-
-### Week 4: First Rendering
-
-**Day 1-3: Single Chunk**
-- Upload mesh to GPU
-- Camera integration
-- Render with lighting
-
-**Day 4-7: Multiple Chunks**
-- Render 16 chunks
-- Basic culling
-- Performance tuning
-
-### Week 5: Production Quality
-
-- LOD system
-- Full frustum culling
-- 60 FPS with 64+ chunks
-- Texture atlas
-- Sky rendering
+- Scheduler that triggers on wall-clock and playtime thresholds.
+- Incremental snapshot format building on existing RLE region files.
+- Retention strategy (ring buffer sized by UI setting) with pruning logs.
+- HUD + menu indicators whenever snapshots run or are pruned.
 
 ---
 
-## Quick Start Commands
+## 6. World Management UI Polish *(roadmap: Next Up)*
 
-```bash
-# Current working demo
-zig build run
+**Objective:** Make save administration approachable.
 
-# Run all tests
-zig build test
-
-# Build release (when ready)
-zig build -Doptimize=ReleaseFast
-
-# Profile memory (when Metal integrated)
-leaks --atExit -- ./zig-out/bin/open-world
-
-# Profile performance (when Metal integrated)
-instruments -t "Time Profiler" ./zig-out/bin/open-world
-```
+- Add panels for:
+  - Difficulty history + overrides.
+  - Autosave/backup configuration with quick actions.
+  - Recent maintenance events (autosaves, backups, compactions, errors).
+- Reuse HUD notification store to populate the history list.
+- Audit all buffers vs. limits (`max_world_name_len`, etc.) to prevent input overflows.
 
 ---
 
-## Decision Point
+## 7. Environmental Simulation Design Pass *(roadmap: Next Up)*
 
-**Choose your next step:**
+**Objective:** Frame Phase 2 scope for weather, fluids, and temperature.
 
-**A. Quick wins first** → Enhanced demo + text visualization
-- ✅ Solidifies foundation
-- ✅ No new dependencies
-- ✅ Immediate results
-- ✅ Better metrics before graphics
-
-**B. Graphics now** → SDL2 + Metal integration
-- ✅ Visual progress
-- ✅ More motivating
-- ✅ Start learning Metal
-- ⚠️  More complexity
-
-**Hybrid: Both!**
-1. Add text visualization (1 day)
-2. Start Metal with SDL2 (rest of week)
-3. Best of both worlds
+- Document requirements (performance budgets, persistence impact, rendering hooks).
+- Outline block-state extensions (liquid levels, temperature metadata).
+- Plan tick scheduling and chunk update flow (threading implications).
+- Produce `docs/environment_sim.md` draft with phased rollout milestones.
 
 ---
 
-**My Recommendation:** Hybrid approach
-- Spend Day 1 on enhanced text demo
-- Days 2-7 on Metal integration
-- This gives immediate visual feedback AND validates systems
+## Execution Rhythm
 
-What would you like to proceed with? 🚀
+- **Weekly loop:** Capture profiling baseline → adjust → update `ROADMAP.md`.
+- **Definition of done:** Code + docs + tests all land before moving items to “Completed”.
+- **Communication:** Reference roadmap section in commit messages and session notes.

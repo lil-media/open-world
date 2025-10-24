@@ -3,6 +3,7 @@ const terrain = @import("terrain.zig");
 
 pub const default_worlds_root = "worlds";
 pub const default_autosave_interval_seconds: u32 = 30;
+pub const default_world_difficulty: Difficulty = .normal;
 const region_span = 32;
 const region_entry_count = region_span * region_span;
 const region_free_capacity = 256;
@@ -15,19 +16,39 @@ const region_magic: u32 = 0x57524731; // "WRG1"
 const region_version: u16 = 1;
 pub const default_region_backup_retention: usize = 3;
 
+pub const Difficulty = enum(u8) {
+    peaceful,
+    easy,
+    normal,
+    hard,
+};
+
+pub fn difficultyLabel(d: Difficulty) []const u8 {
+    return switch (d) {
+        .peaceful => "Peaceful",
+        .easy => "Easy",
+        .normal => "Normal",
+        .hard => "Hard",
+    };
+}
+
 pub const InitOptions = struct {
     seed: ?u64 = null,
     force_new: bool = false,
     worlds_root: []const u8 = default_worlds_root,
+    description: ?[]const u8 = null,
 };
 
 pub const WorldInfo = struct {
     name: []const u8,
     seed: u64,
     last_played_timestamp: i64,
+    difficulty: Difficulty,
+    description: []const u8,
 
     pub fn deinit(self: WorldInfo, allocator: std.mem.Allocator) void {
         allocator.free(self.name);
+        allocator.free(self.description);
     }
 };
 
@@ -35,6 +56,9 @@ pub const WorldSettingsSummary = struct {
     autosave_interval_seconds: u32,
     backup_retention: usize,
     last_backup_timestamp: i64,
+    difficulty: Difficulty,
+    maintenance_last_timestamp: i64,
+    maintenance_queued: usize,
 };
 
 pub fn loadWorldSettingsSummary(
@@ -46,10 +70,14 @@ pub fn loadWorldSettingsSummary(
     defer wp.deinit();
 
     const backup = wp.backupStatus();
+    const maintenance = wp.getMaintenanceMetrics();
     return .{
         .autosave_interval_seconds = wp.autosaveIntervalSeconds(),
         .backup_retention = wp.regionBackupRetention(),
         .last_backup_timestamp = backup.last_backup_timestamp,
+        .difficulty = wp.difficulty,
+        .maintenance_last_timestamp = maintenance.last_compaction_timestamp,
+        .maintenance_queued = maintenance.queued_regions,
     };
 }
 
@@ -75,6 +103,17 @@ pub fn setWorldBackupRetention(
     wp.setRegionBackupRetention(retention);
 }
 
+pub fn setWorldDifficulty(
+    allocator: std.mem.Allocator,
+    worlds_root: []const u8,
+    world_name: []const u8,
+    difficulty: Difficulty,
+) !void {
+    var wp = try WorldPersistence.init(allocator, world_name, .{ .worlds_root = worlds_root });
+    defer wp.deinit();
+    wp.setDifficulty(difficulty);
+}
+
 pub fn resetWorldSettings(
     allocator: std.mem.Allocator,
     worlds_root: []const u8,
@@ -84,6 +123,18 @@ pub fn resetWorldSettings(
     defer wp.deinit();
     wp.setAutosaveIntervalSeconds(default_autosave_interval_seconds);
     wp.setRegionBackupRetention(default_region_backup_retention);
+    wp.setDifficulty(default_world_difficulty);
+}
+
+pub fn setWorldDescription(
+    allocator: std.mem.Allocator,
+    worlds_root: []const u8,
+    world_name: []const u8,
+    description: []const u8,
+) !void {
+    var wp = try WorldPersistence.init(allocator, world_name, .{ .worlds_root = worlds_root });
+    defer wp.deinit();
+    wp.setDescription(description);
 }
 
 pub const Compression = enum(u8) {
@@ -159,6 +210,8 @@ pub const WorldMetadata = struct {
     creation_timestamp: i64,
     last_played_timestamp: i64,
     version: u32,
+    difficulty: Difficulty = default_world_difficulty,
+    description: []const u8 = "",
 
     pub fn save(self: WorldMetadata, allocator: std.mem.Allocator, path: []const u8) !void {
         const json_bytes = try std.json.Stringify.valueAlloc(allocator, self, .{ .whitespace = .indent_2 });
@@ -174,11 +227,25 @@ pub const WorldMetadata = struct {
         const json_data = try std.fs.cwd().readFileAlloc(allocator, path, 1024 * 1024);
         defer allocator.free(json_data);
 
-        const parsed = try std.json.parseFromSlice(WorldMetadata, allocator, json_data, .{});
+        const Parsed = struct {
+            name: []const u8,
+            seed: u64,
+            creation_timestamp: i64,
+            last_played_timestamp: i64,
+            version: u32,
+            difficulty: ?Difficulty = null,
+            description: ?[]const u8 = null,
+        };
+
+        const parsed = try std.json.parseFromSlice(Parsed, allocator, json_data, .{});
         defer parsed.deinit();
 
-        // Deep copy the name string
         const name_copy = try allocator.dupe(u8, parsed.value.name);
+
+        const description_copy = if (parsed.value.description) |desc|
+            allocator.dupe(u8, desc) catch allocator.alloc(u8, 0) catch unreachable
+        else
+            allocator.alloc(u8, 0) catch unreachable;
 
         return WorldMetadata{
             .name = name_copy,
@@ -186,11 +253,14 @@ pub const WorldMetadata = struct {
             .creation_timestamp = parsed.value.creation_timestamp,
             .last_played_timestamp = parsed.value.last_played_timestamp,
             .version = parsed.value.version,
+            .difficulty = parsed.value.difficulty orelse default_world_difficulty,
+            .description = description_copy,
         };
     }
 
     pub fn deinit(self: *WorldMetadata, allocator: std.mem.Allocator) void {
         allocator.free(self.name);
+        allocator.free(self.description);
     }
 };
 
@@ -348,6 +418,7 @@ pub const WorldPersistence = struct {
     pending_compactions: std.ArrayListUnmanaged(RegionCoord),
     pending_compaction_set: std.AutoHashMap(u64, void),
     maintenance_metrics: MaintenanceMetrics,
+    difficulty: Difficulty,
 
     pub const Error = error{
         SeedMismatch,
@@ -429,6 +500,11 @@ pub const WorldPersistence = struct {
                 .creation_timestamp = now,
                 .last_played_timestamp = now,
                 .version = 1,
+                .difficulty = default_world_difficulty,
+                .description = if (options.description) |desc|
+                    try allocator.dupe(u8, desc)
+                else
+                    try allocator.alloc(u8, 0),
             };
 
             const meta_path = try std.fmt.allocPrint(allocator, "{s}/world.meta", .{world_dir});
@@ -462,9 +538,13 @@ pub const WorldPersistence = struct {
             .pending_compactions = .{},
             .pending_compaction_set = std.AutoHashMap(u64, void).init(allocator),
             .maintenance_metrics = .{},
+            .difficulty = metadata.difficulty,
         };
 
         persistence.loadSettings();
+        if (options.description) |desc| {
+            persistence.setDescription(desc);
+        }
         return persistence;
     }
 
@@ -478,6 +558,10 @@ pub const WorldPersistence = struct {
 
     pub fn seed(self: *const WorldPersistence) u64 {
         return self.metadata.seed;
+    }
+
+    pub fn description(self: *const WorldPersistence) []const u8 {
+        return self.metadata.description;
     }
 
     /// Save world metadata
@@ -532,6 +616,31 @@ pub const WorldPersistence = struct {
 
         self.writeBackupConfig(effective);
         self.enforceAllRegionBackups();
+    }
+
+    pub fn setDescription(self: *WorldPersistence, desc: []const u8) void {
+        const copy = self.allocator.dupe(u8, desc) catch self.allocator.alloc(u8, 0) catch return;
+        self.allocator.free(self.metadata.description);
+        self.metadata.description = copy;
+        self.saveMetadata() catch {};
+    }
+
+    pub fn queueRegionCompactionRequest(self: *WorldPersistence, region_x: i32, region_z: i32) void {
+        self.queueRegionCompaction(region_x, region_z) catch {};
+    }
+
+    pub fn queuedCompactions(self: *const WorldPersistence) usize {
+        return self.maintenance_metrics.queued_regions;
+    }
+
+    pub fn setDifficulty(self: *WorldPersistence, difficulty: Difficulty) void {
+        self.difficulty = difficulty;
+        self.metadata.difficulty = difficulty;
+        self.saveMetadata() catch {};
+    }
+
+    pub fn difficultyLevel(self: *const WorldPersistence) Difficulty {
+        return self.difficulty;
     }
 
     fn writeBackupConfig(self: *WorldPersistence, retention: usize) void {
@@ -596,7 +705,7 @@ pub const WorldPersistence = struct {
     }
 
     fn loadAutosaveConfig(self: *WorldPersistence) void {
-        const path = std.fmt.allocPrint(self.allocator, "{s}/autosave.cfg", .{ self.world_dir }) catch return;
+        const path = std.fmt.allocPrint(self.allocator, "{s}/autosave.cfg", .{self.world_dir}) catch return;
         defer self.allocator.free(path);
 
         const file = std.fs.cwd().openFile(path, .{}) catch return;
@@ -618,7 +727,7 @@ pub const WorldPersistence = struct {
     }
 
     fn loadBackupConfig(self: *WorldPersistence) void {
-        const path = std.fmt.allocPrint(self.allocator, "{s}/backups.cfg", .{ self.world_dir }) catch return;
+        const path = std.fmt.allocPrint(self.allocator, "{s}/backups.cfg", .{self.world_dir}) catch return;
         defer self.allocator.free(path);
 
         const file = std.fs.cwd().openFile(path, .{}) catch return;
@@ -669,10 +778,13 @@ pub const WorldPersistence = struct {
             defer metadata.deinit(allocator);
 
             const name_copy = try allocator.dupe(u8, entry.name);
+            const desc_copy = try allocator.dupe(u8, metadata.description);
             try infos.append(allocator, .{
                 .name = name_copy,
                 .seed = metadata.seed,
                 .last_played_timestamp = metadata.last_played_timestamp,
+                .difficulty = metadata.difficulty,
+                .description = desc_copy,
             });
         }
 
@@ -1380,4 +1492,36 @@ test "chunk save/load with compression round-trip" {
     try std.testing.expectEqual(@intFromEnum(terrain.BlockType.sand), @intFromEnum(loaded.blocks[10][10][128].block_type));
 
     try std.testing.expect((try wp.loadChunk(5, 5)) == null);
+}
+
+test "world settings summary reflects updates" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tmp_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tmp_path);
+
+    const worlds_root = try std.fmt.allocPrint(std.testing.allocator, "{s}/worlds", .{tmp_path});
+    defer std.testing.allocator.free(worlds_root);
+
+    var wp = try WorldPersistence.init(std.testing.allocator, "settings_test", .{
+        .worlds_root = worlds_root,
+        .force_new = true,
+    });
+    defer wp.deinit();
+
+    wp.setAutosaveIntervalSeconds(45);
+    wp.setRegionBackupRetention(5);
+    wp.setDifficulty(.hard);
+
+    const summary = try loadWorldSettingsSummary(std.testing.allocator, worlds_root, "settings_test");
+    try std.testing.expectEqual(@as(u32, 45), summary.autosave_interval_seconds);
+    try std.testing.expectEqual(@as(usize, 5), summary.backup_retention);
+    try std.testing.expectEqual(Difficulty.hard, summary.difficulty);
+    try std.testing.expectEqual(@as(i64, 0), summary.maintenance_last_timestamp);
+    try std.testing.expectEqual(@as(usize, 0), summary.maintenance_queued);
+
+    wp.queueRegionCompactionRequest(0, 0);
+    const metrics = wp.getMaintenanceMetrics();
+    try std.testing.expect(metrics.queued_regions > 0);
 }
