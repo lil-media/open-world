@@ -58,15 +58,16 @@ This plan translates the roadmap “In Progress” and “Next Up” buckets int
 
 ---
 
-## 4. Multi-Block Selection & Copy/Paste *(roadmap: Next Up)*
+## 4. Multi-Block Selection & Copy/Paste *(roadmap: Completed 2025-10-22)*
 
-**Objective:** Introduce creative tooling without breaking single-block flow.
+**Shipped:**
+- Selection state helpers (`beginSelection`, `updateSelection`, `selectionBounds`, `clearSelection`).
+- Clipboard storage and replay (`copySelection`, `clipboardDimensions`, `pasteClipboard`) with regression tests.
 
-- Design selection data structure (min/max corners + block palette).
-- Prototype input binding (e.g., hold `Shift` to start selection, drag span).
-- Render selection volume via existing line mesh system.
-- Implement clipboard apply/rotate; start as in-memory only.
-- After playtesting, expose in UI with clear affordances.
+**Next UI integration tasks:**
+- Bind drag/anchor input to the new helpers and surface selection sizing in the HUD.
+- Render the active selection volume with the existing line mesh system.
+- Extend the paste path with rotation/mirroring toggles before exposing the tools broadly.
 
 ---
 

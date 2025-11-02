@@ -70,6 +70,105 @@ fn updateHudNotifications(list: *std.ArrayListUnmanaged(HudNotification), delta:
     }
 }
 
+const SaveSettingsPanel = struct {
+    open: bool = false,
+    selection: usize = 0,
+    autosave_options: std.ArrayListUnmanaged(u32) = .{},
+    autosave_index: usize = 0,
+    backup_options: std.ArrayListUnmanaged(usize) = .{},
+    backup_index: usize = 0,
+
+    fn deinit(self: *SaveSettingsPanel, allocator: std.mem.Allocator) void {
+        self.autosave_options.deinit(allocator);
+        self.backup_options.deinit(allocator);
+    }
+
+    fn refresh(self: *SaveSettingsPanel, allocator: std.mem.Allocator, autosave_value: u32, backup_value: usize) !void {
+        self.autosave_options.clearRetainingCapacity();
+        self.backup_options.clearRetainingCapacity();
+
+        try self.autosave_options.appendSlice(allocator, &autosave_default_presets);
+        try self.backup_options.appendSlice(allocator, &backup_default_presets);
+
+        if (autosave_value != 0) {
+            var found = false;
+            for (self.autosave_options.items, 0..) |value, idx| {
+                if (value == autosave_value) {
+                    self.autosave_index = idx;
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                try self.autosave_options.append(allocator, autosave_value);
+            }
+        } else {
+            self.autosave_index = 0;
+        }
+
+        var found_backup = false;
+        for (self.backup_options.items, 0..) |value, idx| {
+            if (value == backup_value) {
+                self.backup_index = idx;
+                found_backup = true;
+                break;
+            }
+        }
+        if (!found_backup) {
+            try self.backup_options.append(allocator, backup_value);
+        }
+
+        std.sort.heap(u32, self.autosave_options.items, {}, struct {
+            fn lessThan(_: void, lhs: u32, rhs: u32) bool {
+                return lhs < rhs;
+            }
+        }.lessThan);
+        std.sort.heap(usize, self.backup_options.items, {}, struct {
+            fn lessThan(_: void, lhs: usize, rhs: usize) bool {
+                return lhs < rhs;
+            }
+        }.lessThan);
+
+        // Recompute indices after sorting.
+        self.autosave_index = 0;
+        for (self.autosave_options.items, 0..) |value, idx| {
+            if (value == autosave_value) {
+                self.autosave_index = idx;
+                break;
+            }
+        }
+
+        self.backup_index = 0;
+        for (self.backup_options.items, 0..) |value, idx| {
+            if (value == backup_value) {
+                self.backup_index = idx;
+                break;
+            }
+        }
+
+        if (self.selection > 1) self.selection = 1;
+    }
+
+    fn autosaveCurrent(self: *const SaveSettingsPanel) u32 {
+        if (self.autosave_options.items.len == 0) return persistence.default_autosave_interval_seconds;
+        return self.autosave_options.items[self.autosave_index];
+    }
+
+    fn backupCurrent(self: *const SaveSettingsPanel) usize {
+        if (self.backup_options.items.len == 0) return persistence.default_region_backup_retention;
+        return self.backup_options.items[self.backup_index];
+    }
+};
+
+const SaveSettingsPanelView = struct {
+    open: bool,
+    selection: usize,
+    autosave: []const u32,
+    autosave_index: usize,
+    backup: []const usize,
+    backup_index: usize,
+};
+
 fn difficultyLabelShort(diff: persistence.Difficulty) []const u8 {
     return persistence.difficultyLabel(diff);
 }
@@ -471,6 +570,8 @@ fn showWorldSelectionMenu(
     var status_timer: f32 = 0;
     var status_buffer: [128]u8 = undefined;
     var last_settings_selection: ?usize = null;
+    var settings_panel = SaveSettingsPanel{};
+    defer settings_panel.deinit(allocator);
     var selected_settings = persistence.WorldSettingsSummary{
         .autosave_interval_seconds = persistence.default_autosave_interval_seconds,
         .backup_retention = persistence.default_region_backup_retention,
@@ -478,6 +579,8 @@ fn showWorldSelectionMenu(
         .difficulty = persistence.default_world_difficulty,
         .maintenance_last_timestamp = 0,
         .maintenance_queued = 0,
+        .maintenance_interval_seconds = persistence.default_backup_schedule_interval_seconds,
+        .maintenance_activity_score = 0,
     };
     var renaming = false;
     var rename_buffer: [max_world_name_len]u8 = undefined;
@@ -503,9 +606,14 @@ fn showWorldSelectionMenu(
                 .difficulty = persistence.default_world_difficulty,
                 .maintenance_last_timestamp = 0,
                 .maintenance_queued = 0,
+                .maintenance_interval_seconds = persistence.default_backup_schedule_interval_seconds,
+                .maintenance_activity_score = 0,
             };
         };
         last_settings_selection = selection;
+        settings_panel.refresh(allocator, selected_settings.autosave_interval_seconds, selected_settings.backup_retention) catch |err| {
+            std.debug.print("Failed to prepare settings panel: {any}\n", .{err});
+        };
     }
 
     const frame_dt: f32 = 1.0 / 60.0;
@@ -645,6 +753,7 @@ fn showWorldSelectionMenu(
                 rename_buffer[0..rename_len],
                 null,
                 null,
+                null,
                 window.width,
                 window.height,
             );
@@ -751,6 +860,7 @@ fn showWorldSelectionMenu(
                 null,
                 seed_buffer[0..seed_len],
                 null,
+                null,
                 window.width,
                 window.height,
             );
@@ -821,6 +931,7 @@ fn showWorldSelectionMenu(
                 null,
                 null,
                 description_buffer[0..description_len],
+                null,
                 window.width,
                 window.height,
             );
@@ -833,10 +944,12 @@ fn showWorldSelectionMenu(
             selection = (selection + 1) % option_count;
             confirm_delete = null;
             last_settings_selection = null;
+            settings_panel.open = false;
         } else if (input_state.wasKeyPressed(.up)) {
             selection = (selection + option_count - 1) % option_count;
             confirm_delete = null;
             last_settings_selection = null;
+            settings_panel.open = false;
         }
 
         if (input_state.wasKeyPressed(.escape)) {
@@ -855,12 +968,135 @@ fn showWorldSelectionMenu(
                         .difficulty = persistence.default_world_difficulty,
                         .maintenance_last_timestamp = 0,
                         .maintenance_queued = 0,
+                        .maintenance_interval_seconds = persistence.default_backup_schedule_interval_seconds,
+                        .maintenance_activity_score = 0,
                     };
                 };
                 last_settings_selection = selection;
+                settings_panel.refresh(allocator, selected_settings.autosave_interval_seconds, selected_settings.backup_retention) catch |err| {
+                    std.debug.print("Failed to prepare settings panel: {any}\n", .{err});
+                };
             }
         } else {
             last_settings_selection = null;
+            settings_panel.open = false;
+        }
+
+        if (settings_panel.open and selection < infos.len) {
+            if (input_state.wasKeyPressed(.escape) or input_state.wasKeyPressed(.f6)) {
+                settings_panel.open = false;
+                continue;
+            }
+
+            var panel_selection = settings_panel.selection;
+            if (input_state.wasKeyPressed(.down)) {
+                if (panel_selection < 1) panel_selection += 1;
+            } else if (input_state.wasKeyPressed(.up)) {
+                if (panel_selection > 0) panel_selection -= 1;
+            }
+            settings_panel.selection = panel_selection;
+
+            if (input_state.wasKeyPressed(.right) or input_state.wasKeyPressed(.left)) {
+                const dir: i32 = if (input_state.wasKeyPressed(.right)) 1 else -1;
+                switch (settings_panel.selection) {
+                    0 => {
+                        if (settings_panel.autosave_options.items.len > 0) {
+                            const len_i32: i32 = @intCast(settings_panel.autosave_options.items.len);
+                            const next = @mod(@as(i32, @intCast(settings_panel.autosave_index)) + dir + len_i32, len_i32);
+                            const new_index: usize = @intCast(next);
+                            const new_value = settings_panel.autosave_options.items[new_index];
+                            if (new_value != selected_settings.autosave_interval_seconds) {
+                                const world_name = infos[selection].name;
+                                const autosave_success = blk: {
+                                    persistence.setWorldAutosaveInterval(allocator, worlds_root, world_name, new_value) catch |err| {
+                                        std.debug.print("Failed to update autosave interval for '{s}': {any}\n", .{ world_name, err });
+                                        status_message = "AUTOSAVE UPDATE FAILED";
+                                        status_timer = 3.0;
+                                        break :blk false;
+                                    };
+                                    break :blk true;
+                                };
+                                if (autosave_success) {
+                                    settings_panel.autosave_index = new_index;
+                                    selected_settings.autosave_interval_seconds = new_value;
+                                    status_message = if (new_value == 0)
+                                        "AUTOSAVE OFF"
+                                    else
+                                        std.fmt.bufPrint(&status_buffer, "AUTOSAVE EVERY {d}s", .{new_value}) catch "AUTOSAVE UPDATED";
+                                    status_timer = 3.0;
+                                    std.debug.print("World '{s}' autosave interval set to {d} seconds.\n", .{ world_name, new_value });
+                                }
+                            }
+                        }
+                    },
+                    1 => {
+                        if (settings_panel.backup_options.items.len > 0) {
+                            const len_i32: i32 = @intCast(settings_panel.backup_options.items.len);
+                            const next = @mod(@as(i32, @intCast(settings_panel.backup_index)) + dir + len_i32, len_i32);
+                            const new_index: usize = @intCast(next);
+                            const new_value = settings_panel.backup_options.items[new_index];
+                            if (new_value != selected_settings.backup_retention) {
+                                const world_name = infos[selection].name;
+                                const backup_success = blk: {
+                                    persistence.setWorldBackupRetention(allocator, worlds_root, world_name, new_value) catch |err| {
+                                        std.debug.print("Failed to update backups retention for '{s}': {any}\n", .{ world_name, err });
+                                        status_message = "BACKUPS UPDATE FAILED";
+                                        status_timer = 3.0;
+                                        break :blk false;
+                                    };
+                                    break :blk true;
+                                };
+                                if (backup_success) {
+                                    settings_panel.backup_index = new_index;
+                                    selected_settings.backup_retention = new_value;
+                                    status_message = std.fmt.bufPrint(&status_buffer, "BACKUPS KEEP {d}", .{new_value}) catch "BACKUPS UPDATED";
+                                    status_timer = 3.0;
+                                    std.debug.print("World '{s}' backup retention set to {d}.\n", .{ world_name, new_value });
+                                }
+                            }
+                        }
+                    },
+                    else => {},
+                }
+            }
+
+            try renderWorldSelectionOverlay(
+                allocator,
+                metal_ctx,
+                infos,
+                selection,
+                confirm_delete,
+                status_message,
+                selected_settings,
+                null,
+                null,
+                null,
+                window.width,
+                window.height,
+                .{
+                    .open = true,
+                    .selection = settings_panel.selection,
+                    .autosave = settings_panel.autosave_options.items,
+                    .autosave_index = settings_panel.autosave_index,
+                    .backup = settings_panel.backup_options.items,
+                    .backup_index = settings_panel.backup_index,
+                },
+            );
+
+            std.Thread.sleep(16 * std.time.ns_per_ms);
+            continue;
+        }
+
+        var panel_view: ?SaveSettingsPanelView = null;
+        if (settings_panel.open and selection < infos.len) {
+            panel_view = SaveSettingsPanelView{
+                .open = true,
+                .selection = settings_panel.selection,
+                .autosave = settings_panel.autosave_options.items,
+                .autosave_index = settings_panel.autosave_index,
+                .backup = settings_panel.backup_options.items,
+                .backup_index = settings_panel.backup_index,
+            };
         }
 
         if (selection < infos.len and input_state.wasKeyPressed(.f10)) {
@@ -902,6 +1138,13 @@ fn showWorldSelectionMenu(
                     status_timer = 3.0;
                     continue;
                 }
+            }
+        }
+
+        if (!renaming and !editing_seed and !editing_description and selection < infos.len and input_state.wasKeyPressed(.f6)) {
+            settings_panel.open = !settings_panel.open;
+            if (settings_panel.open) {
+                settings_panel.selection = 0;
             }
         }
 
@@ -1057,6 +1300,9 @@ fn showWorldSelectionMenu(
                             std.fmt.bufPrint(&status_buffer, "AUTOSAVE EVERY {d}s", .{new_interval}) catch "AUTOSAVE UPDATED";
                         status_timer = 3.0;
                         std.debug.print("World '{s}' autosave interval set to {d} seconds.\n", .{ world_name, new_interval });
+                        settings_panel.refresh(allocator, selected_settings.autosave_interval_seconds, selected_settings.backup_retention) catch |err| {
+                            std.debug.print("Failed to refresh settings panel after autosave change: {any}\n", .{err});
+                        };
                     }
                 }
             }
@@ -1128,6 +1374,9 @@ fn showWorldSelectionMenu(
                             status_message = std.fmt.bufPrint(&status_buffer, "BACKUPS KEEP {d}", .{new_retention}) catch "BACKUPS UPDATED";
                             status_timer = 3.0;
                             std.debug.print("World '{s}' backup retention set to {d}.\n", .{ world_name, new_retention });
+                            settings_panel.refresh(allocator, selected_settings.autosave_interval_seconds, selected_settings.backup_retention) catch |err| {
+                                std.debug.print("Failed to refresh settings panel after backups change: {any}\n", .{err});
+                            };
                         }
                     }
                 }
@@ -1198,6 +1447,9 @@ fn showWorldSelectionMenu(
                             status_message = std.fmt.bufPrint(&status_buffer, "BACKUPS KEEP {d}", .{new_retention}) catch "BACKUPS UPDATED";
                             status_timer = 3.0;
                             std.debug.print("World '{s}' backup retention set to {d}.\n", .{ world_name, new_retention });
+                            settings_panel.refresh(allocator, selected_settings.autosave_interval_seconds, selected_settings.backup_retention) catch |err| {
+                                std.debug.print("Failed to refresh settings panel after backups change: {any}\n", .{err});
+                            };
                         }
                     }
                 }
@@ -1223,9 +1475,14 @@ fn showWorldSelectionMenu(
                             .difficulty = persistence.default_world_difficulty,
                             .maintenance_last_timestamp = 0,
                             .maintenance_queued = 0,
+                            .maintenance_interval_seconds = persistence.default_backup_schedule_interval_seconds,
+                            .maintenance_activity_score = 0,
                         };
                     };
                     infos[selection].difficulty = selected_settings.difficulty;
+                    settings_panel.refresh(allocator, selected_settings.autosave_interval_seconds, selected_settings.backup_retention) catch |err| {
+                        std.debug.print("Failed to refresh settings panel after reset: {any}\n", .{err});
+                    };
                     status_message = "SETTINGS RESET";
                     status_timer = 3.0;
                     std.debug.print("World '{s}' settings reset to defaults.\n", .{world_name});
@@ -1278,6 +1535,7 @@ fn showWorldSelectionMenu(
             null,
             null,
             null,
+            panel_view,
             window.width,
             window.height,
         );
@@ -1297,6 +1555,7 @@ fn renderWorldSelectionOverlay(
     rename_text: ?[]const u8,
     seed_text: ?[]const u8,
     description_text: ?[]const u8,
+    settings_panel: ?SaveSettingsPanelView,
     screen_width: u32,
     screen_height: u32,
 ) !void {
@@ -1340,13 +1599,24 @@ fn renderWorldSelectionOverlay(
                 max_width = @max(max_width, line_text.textWidth(retention_text, text_scale));
                 line_count += 1;
 
-                const maintenance_minutes = @divFloor(streaming.default_backup_schedule_interval_seconds + 59, 60);
-                const maintenance_text = std.fmt.bufPrint(&buf, "MAINT: EVERY {d}m", .{maintenance_minutes}) catch "MAINT";
+                const maintenance_seconds = settings.maintenance_interval_seconds;
+                const maintenance_minutes = if (maintenance_seconds == 0)
+                    0
+                else
+                    @divFloor(maintenance_seconds + 59, 60);
+                const maintenance_text = if (maintenance_seconds == 0)
+                    "MAINT: OFF"
+                else
+                    std.fmt.bufPrint(&buf, "MAINT: EVERY {d}m", .{maintenance_minutes}) catch "MAINT";
                 max_width = @max(max_width, line_text.textWidth(maintenance_text, text_scale));
                 line_count += 1;
 
                 const maint_queue_text = std.fmt.bufPrint(&buf, "MAINT: QUEUED {d}", .{settings.maintenance_queued}) catch "MAINT QUEUED";
                 max_width = @max(max_width, line_text.textWidth(maint_queue_text, text_scale));
+                line_count += 1;
+
+                const maint_activity_text = std.fmt.bufPrint(&buf, "MAINT: ACT {d:.1}", .{settings.maintenance_activity_score}) catch "MAINT ACT";
+                max_width = @max(max_width, line_text.textWidth(maint_activity_text, text_scale));
                 line_count += 1;
 
                 const ts_str = formatTimestamp(&timestamp_buf, settings.last_backup_timestamp);
@@ -1414,20 +1684,31 @@ fn renderWorldSelectionOverlay(
     }
 
     const instructions_primary = "ENTER PLAY  R RENAME  S SEED  DEL/BKSP DELETE  ESC QUIT";
-    const instructions_secondary = "F1/F2 DIFFICULTY  F5 AUTOSAVE  F7/F8 BACKUPS  F9 RESET  F10 DESC  F11 BACKUP";
+    const instructions_secondary = "F1/F2 DIFFICULTY  F5 AUTOSAVE  F6 SETTINGS  F7/F8 BACKUPS  F9 RESET  F10 DESC  F11 BACKUP";
     max_width = @max(max_width, line_text.textWidth(instructions_primary, text_scale));
     line_count += 1;
     max_width = @max(max_width, line_text.textWidth(instructions_secondary, text_scale));
     line_count += 1;
 
-    const panel_width = max_width + padding * 2.0;
-    const panel_height = @as(f32, @floatFromInt(line_count)) * line_height + padding * 2.0;
+    const panel_hint = if (settings_panel) |panel| if (panel.open)
+        "PANEL: UP/DOWN SELECT  LEFT/RIGHT CHANGE  ESC CLOSE"
+    else
+        null
+    else
+        null;
+    if (panel_hint) |hint| {
+        max_width = @max(max_width, line_text.textWidth(hint, text_scale));
+        line_count += 1;
+    }
+
+    const main_panel_width = max_width + padding * 2.0;
+    const main_panel_height = @as(f32, @floatFromInt(line_count)) * line_height + padding * 2.0;
 
     try line_text.appendQuad(
         &builder,
         allocator,
         origin_px,
-        origin_px.add(math.Vec2.init(panel_width, panel_height)),
+        origin_px.add(math.Vec2.init(main_panel_width, main_panel_height)),
         screen_size,
         [4]f32{ 0.05, 0.07, 0.12, 0.88 },
     );
@@ -1463,13 +1744,24 @@ fn renderWorldSelectionOverlay(
                 try line_text.appendText(&builder, allocator, retention_line, cursor, text_scale, screen_size, [4]f32{ 0.68, 0.92, 0.78, 1.0 });
                 cursor.y += line_height;
 
-                const maintenance_minutes = @divFloor(streaming.default_backup_schedule_interval_seconds + 59, 60);
-                const maintenance_line = std.fmt.bufPrint(&buf, "MAINT: EVERY {d}m", .{maintenance_minutes}) catch "MAINT";
+                const maintenance_seconds = settings.maintenance_interval_seconds;
+                const maintenance_minutes = if (maintenance_seconds == 0)
+                    0
+                else
+                    @divFloor(maintenance_seconds + 59, 60);
+                const maintenance_line = if (maintenance_seconds == 0)
+                    "MAINT: OFF"
+                else
+                    std.fmt.bufPrint(&buf, "MAINT: EVERY {d}m", .{maintenance_minutes}) catch "MAINT";
                 try line_text.appendText(&builder, allocator, maintenance_line, cursor, text_scale, screen_size, [4]f32{ 0.7, 0.9, 1.0, 1.0 });
                 cursor.y += line_height;
 
                 const maintenance_queue_line = std.fmt.bufPrint(&buf, "MAINT: QUEUED {d}", .{settings.maintenance_queued}) catch "MAINT QUEUED";
                 try line_text.appendText(&builder, allocator, maintenance_queue_line, cursor, text_scale, screen_size, [4]f32{ 0.7, 0.9, 1.0, 1.0 });
+                cursor.y += line_height;
+
+                const maintenance_activity_line = std.fmt.bufPrint(&buf, "MAINT: ACT {d:.1}", .{settings.maintenance_activity_score}) catch "MAINT ACT";
+                try line_text.appendText(&builder, allocator, maintenance_activity_line, cursor, text_scale, screen_size, [4]f32{ 0.68, 0.92, 0.86, 1.0 });
                 cursor.y += line_height;
 
                 const ts_str = formatTimestamp(&timestamp_buf, settings.last_backup_timestamp);
@@ -1545,6 +1837,73 @@ fn renderWorldSelectionOverlay(
     try line_text.appendText(&builder, allocator, instructions_primary, cursor, text_scale, screen_size, [4]f32{ 0.7, 0.85, 1.0, 1.0 });
     cursor.y += line_height;
     try line_text.appendText(&builder, allocator, instructions_secondary, cursor, text_scale, screen_size, [4]f32{ 0.65, 0.8, 1.0, 1.0 });
+    cursor.y += line_height;
+    if (panel_hint) |hint| {
+        try line_text.appendText(&builder, allocator, hint, cursor, text_scale, screen_size, [4]f32{ 0.6, 0.78, 1.0, 1.0 });
+        cursor.y += line_height;
+    }
+
+    if (settings_panel) |panel| {
+        if (panel.open) {
+            var settings_width = line_text.textWidth("SAVE SETTINGS", text_scale);
+            var settings_lines: usize = 1;
+
+            var autosave_value_buf: [32]u8 = undefined;
+            var autosave_line_buf: [96]u8 = undefined;
+            const autosave_value = if (panel.autosave.len == 0) persistence.default_autosave_interval_seconds else panel.autosave[panel.autosave_index];
+            const autosave_text: []const u8 = if (panel.autosave.len == 0)
+                "N/A"
+            else if (autosave_value == 0)
+                "OFF"
+            else
+                std.fmt.bufPrint(&autosave_value_buf, "{d}s", .{autosave_value}) catch "ERR";
+            const autosave_line = std.fmt.bufPrint(&autosave_line_buf, "{s} AUTOSAVE: {s}", .{ if (panel.selection == 0) ">" else " ", autosave_text }) catch "AUTOSAVE";
+            settings_width = @max(settings_width, line_text.textWidth(autosave_line, text_scale));
+            settings_lines += 1;
+
+            var backup_line_buf: [96]u8 = undefined;
+            const backup_value = if (panel.backup.len == 0) persistence.default_region_backup_retention else panel.backup[panel.backup_index];
+            const backup_line = std.fmt.bufPrint(&backup_line_buf, "{s} BACKUPS: KEEP {d}", .{ if (panel.selection == 1) ">" else " ", backup_value }) catch "BACKUPS";
+            settings_width = @max(settings_width, line_text.textWidth(backup_line, text_scale));
+            settings_lines += 1;
+
+            const settings_hint = "UP/DOWN select field";
+            const settings_hint2 = "LEFT/RIGHT change  ESC/F6 close";
+            settings_width = @max(settings_width, line_text.textWidth(settings_hint, text_scale));
+            settings_width = @max(settings_width, line_text.textWidth(settings_hint2, text_scale));
+            settings_lines += 2;
+
+            const settings_panel_width = settings_width + padding * 2.0;
+            const settings_panel_height = @as(f32, @floatFromInt(settings_lines)) * line_height + padding * 2.0;
+            const offset = math.Vec2.init(main_panel_width + 32.0, 0.0);
+            const settings_origin = origin_px.add(offset);
+
+            try line_text.appendQuad(
+                &builder,
+                allocator,
+                settings_origin,
+                settings_origin.add(math.Vec2.init(settings_panel_width, settings_panel_height)),
+                screen_size,
+                [4]f32{ 0.08, 0.1, 0.16, 0.92 },
+            );
+
+            var settings_cursor = settings_origin.add(math.Vec2.init(padding, padding));
+            try line_text.appendText(&builder, allocator, "SAVE SETTINGS", settings_cursor, text_scale, screen_size, [4]f32{ 0.88, 0.94, 1.0, 1.0 });
+            settings_cursor.y += line_height;
+
+            const autosave_color = if (panel.selection == 0) [4]f32{ 1.0, 0.92, 0.62, 1.0 } else [4]f32{ 0.7, 0.86, 1.0, 1.0 };
+            try line_text.appendText(&builder, allocator, autosave_line, settings_cursor, text_scale, screen_size, autosave_color);
+            settings_cursor.y += line_height;
+
+            const backup_color = if (panel.selection == 1) [4]f32{ 0.8, 1.0, 0.75, 1.0 } else [4]f32{ 0.68, 0.9, 0.78, 1.0 };
+            try line_text.appendText(&builder, allocator, backup_line, settings_cursor, text_scale, screen_size, backup_color);
+            settings_cursor.y += line_height;
+
+            try line_text.appendText(&builder, allocator, settings_hint, settings_cursor, text_scale, screen_size, [4]f32{ 0.62, 0.82, 0.98, 1.0 });
+            settings_cursor.y += line_height;
+            try line_text.appendText(&builder, allocator, settings_hint2, settings_cursor, text_scale, screen_size, [4]f32{ 0.62, 0.82, 0.98, 1.0 });
+        }
+    }
 
     if (builder.items.len == 0) {
         try metal_ctx.setUIMesh(&[_]u8{}, @sizeOf(line_text.UIVertex));
@@ -1594,6 +1953,53 @@ const default_meshes_per_frame: usize = 3;
 
 fn lerp(a: f32, b: f32, t: f32) f32 {
     return math.lerp(a, b, t);
+}
+
+fn resolveTargetDetail(previous: MeshDetail, dist2: f32) MeshDetail {
+    var target = previous;
+    switch (previous) {
+        .full => {
+            if (dist2 > far_distance_sq + far_distance_sq * 0.1) {
+                target = .surfaceFar;
+            } else if (dist2 > medium_distance_sq + medium_distance_sq * 0.1) {
+                target = .surfaceMedium;
+            }
+        },
+        .surfaceMedium => {
+            if (dist2 > far_distance_sq + far_distance_sq * 0.1) {
+                target = .surfaceFar;
+            } else if (dist2 < medium_distance_sq * 0.85) {
+                target = .full;
+            }
+        },
+        .surfaceFar => {
+            if (dist2 < medium_distance_sq * 0.85) {
+                target = .full;
+            } else if (dist2 < far_distance_sq * 0.8) {
+                target = .surfaceMedium;
+            }
+        },
+    }
+    return target;
+}
+
+test "resolveTargetDetail degrades at distance thresholds" {
+    const medium_sq = medium_distance_sq;
+    const far_sq = far_distance_sq;
+
+    try std.testing.expect(resolveTargetDetail(.full, medium_sq * 1.05) == .full);
+    try std.testing.expect(resolveTargetDetail(.full, medium_sq * 1.12) == .surfaceMedium);
+    try std.testing.expect(resolveTargetDetail(.full, far_sq * 1.15) == .surfaceFar);
+}
+
+test "resolveTargetDetail upgrades with hysteresis" {
+    const medium_sq = medium_distance_sq;
+    const far_sq = far_distance_sq;
+
+    try std.testing.expect(resolveTargetDetail(.surfaceFar, far_sq * 0.95) == .surfaceFar);
+    try std.testing.expect(resolveTargetDetail(.surfaceFar, far_sq * 0.75) == .surfaceMedium);
+    try std.testing.expect(resolveTargetDetail(.surfaceMedium, medium_sq * 0.9) == .surfaceMedium);
+    try std.testing.expect(resolveTargetDetail(.surfaceMedium, medium_sq * 0.8) == .full);
 }
 
 /// Helper to get a block from the world at global coordinates
@@ -1826,31 +2232,8 @@ fn updateGpuMeshes(
 
         const current_detail = chunk_manager.getChunkDetail(chunk_pos) orelse .full;
         const previous_desired = chunk_manager.getDesiredDetail(chunk_pos) orelse current_detail;
-        var target_detail = previous_desired;
         const dist2 = candidate.distance2;
-        switch (previous_desired) {
-            .full => {
-                if (dist2 > far_distance_sq + far_distance_sq * 0.1) {
-                    target_detail = .surfaceFar;
-                } else if (dist2 > medium_distance_sq + medium_distance_sq * 0.1) {
-                    target_detail = .surfaceMedium;
-                }
-            },
-            .surfaceMedium => {
-                if (dist2 > far_distance_sq + far_distance_sq * 0.1) {
-                    target_detail = .surfaceFar;
-                } else if (dist2 < medium_distance_sq * 0.85) {
-                    target_detail = .full;
-                }
-            },
-            .surfaceFar => {
-                if (dist2 < medium_distance_sq * 0.85) {
-                    target_detail = .full;
-                } else if (dist2 < far_distance_sq * 0.8) {
-                    target_detail = .surfaceMedium;
-                }
-            },
-        }
+        const target_detail = resolveTargetDetail(previous_desired, dist2);
         chunk_manager.setDesiredDetail(chunk_pos, target_detail);
 
         var cache_entry_ptr_opt = mesh_cache.getPtr(key);
@@ -2223,6 +2606,24 @@ pub fn runConsoleDemo(allocator: std.mem.Allocator) !void {
             "[Autosave] Saved {d} chunks ({d} errors) in {d:.2} ms ({s})\n",
             .{ summary.saved_chunks, summary.errors, duration_ms, reason_str },
         );
+        if (summary.maintenance_enqueued) {
+            const cooldown = chunk_manager.backupCooldownSecondsRemaining();
+            std.debug.print(
+                "[Maintenance] Queue total {d} regions (+{d}, ~{d}s cooldown)\n",
+                .{ summary.queued_regions_total, summary.queued_regions_added, cooldown },
+            );
+            _ = chunk_manager.takeScheduledBackupNotice();
+            if (chunk_manager.takeScheduledMaintenanceIntervalChange()) |seconds| {
+                const minutes = if (seconds == 0)
+                    0
+                else
+                    @divFloor(seconds + 59, 60);
+                std.debug.print(
+                    "[Maintenance] Cadence tuned to {d}s (~{d}m).\n",
+                    .{ seconds, minutes },
+                );
+            }
+        }
     }
 
     viz.displayChunkStats(&chunk_manager);
@@ -2303,18 +2704,14 @@ pub fn runConsoleDemo(allocator: std.mem.Allocator) !void {
                 "[Autosave] Saved {d} chunks ({d} errors) in {d:.2} ms ({s})\n",
                 .{ summary.saved_chunks, summary.errors, duration_ms, reason_str },
             );
-        }
-
-        if (chunk_manager.takeAutosaveSummary()) |summary| {
-            const duration_ms = @as(f64, @floatFromInt(summary.duration_ns)) / 1_000_000.0;
-            const reason_str = switch (summary.reason) {
-                .timer => "auto",
-                .manual => "manual",
-            };
-            std.debug.print(
-                "[Autosave] Saved {d} chunks ({d} errors) in {d:.2} ms ({s})\n",
-                .{ summary.saved_chunks, summary.errors, duration_ms, reason_str },
-            );
+            if (summary.maintenance_enqueued) {
+                const cooldown = chunk_manager.backupCooldownSecondsRemaining();
+                std.debug.print(
+                    "[Maintenance] Queue total {d} regions (+{d}, ~{d}s cooldown)\n",
+                    .{ summary.queued_regions_total, summary.queued_regions_added, cooldown },
+                );
+                _ = chunk_manager.takeScheduledBackupNotice();
+            }
         }
 
         const update_time = std.time.nanoTimestamp();
@@ -2887,6 +3284,7 @@ pub fn runInteractiveDemo(allocator: std.mem.Allocator, options: DemoOptions) !v
             main_camera.setPosition(player_physics.getEyePosition());
 
             try chunk_manager.update(player_physics.position, main_camera.front);
+            var consumed_maintenance_notice = false;
             if (chunk_manager.takeAutosaveSummary()) |summary| {
                 const duration_ms = @as(f64, @floatFromInt(summary.duration_ns)) / 1_000_000.0;
                 const reason_str = switch (summary.reason) {
@@ -2900,9 +3298,24 @@ pub fn runInteractiveDemo(allocator: std.mem.Allocator, options: DemoOptions) !v
                 const msg = std.fmt.bufPrint(&hud_message_buffer, "Autosave: {d} chunks ({d} errors)", .{ summary.saved_chunks, summary.errors }) catch "Autosave complete";
                 pushHudNotification(&hud_notifications, allocator, msg, 4.0);
                 autosave_elapsed = 0;
+                if (summary.maintenance_enqueued) {
+                    const cooldown = chunk_manager.backupCooldownSecondsRemaining();
+                    const maintenance_msg = if (summary.queued_regions_added > 0)
+                        std.fmt.bufPrint(&hud_message_buffer, "Maintenance: +{d} (total {d}, ~{d}s)", .{ summary.queued_regions_added, summary.queued_regions_total, cooldown }) catch "Maintenance queued"
+                    else if (summary.queued_regions_total > 0)
+                        std.fmt.bufPrint(&hud_message_buffer, "Maintenance: total {d} (~{d}s)", .{ summary.queued_regions_total, cooldown }) catch "Maintenance queued"
+                    else
+                        "Maintenance queued";
+                    pushHudNotification(&hud_notifications, allocator, maintenance_msg, 4.0);
+                    std.debug.print(
+                        "[Maintenance] Queue total {d} regions (+{d}) from autosave (cooldown ~{d}s).\n",
+                        .{ summary.queued_regions_total, summary.queued_regions_added, cooldown },
+                    );
+                    consumed_maintenance_notice = chunk_manager.takeScheduledBackupNotice();
+                }
             }
 
-            if (chunk_manager.takeScheduledBackupNotice()) {
+            if (!consumed_maintenance_notice and chunk_manager.takeScheduledBackupNotice()) {
                 const cooldown = chunk_manager.backupCooldownSecondsRemaining();
                 const notice = if (cooldown > 0)
                     std.fmt.bufPrint(&hud_message_buffer, "Maintenance queued (~{d}s cooldown)", .{cooldown}) catch "Maintenance queued"
@@ -2910,6 +3323,19 @@ pub fn runInteractiveDemo(allocator: std.mem.Allocator, options: DemoOptions) !v
                     "Maintenance queued";
                 pushHudNotification(&hud_notifications, allocator, notice, 4.0);
                 std.debug.print("[Maintenance] Queued region compaction batch (cooldown ~{d}s).\n", .{cooldown});
+            }
+
+            if (chunk_manager.takeScheduledMaintenanceIntervalChange()) |seconds| {
+                const minutes = if (seconds == 0)
+                    0
+                else
+                    @divFloor(seconds + 59, 60);
+                const cadence_notice = if (minutes == 0)
+                    "Maintenance cadence paused"
+                else
+                    std.fmt.bufPrint(&hud_message_buffer, "Maintenance cadence ~{d}m", .{minutes}) catch "Maintenance cadence";
+                pushHudNotification(&hud_notifications, allocator, cadence_notice, 4.0);
+                std.debug.print("[Maintenance] Cadence tuned to {d}s (~{d}m).\n", .{ seconds, minutes });
             }
 
             accumulator -= fixed_dt_seconds;
@@ -3036,38 +3462,46 @@ pub fn runInteractiveDemo(allocator: std.mem.Allocator, options: DemoOptions) !v
             }
 
             if (chunk_manager.world_persistence) |wp| {
-                const backup_status = wp.backupStatus();
-                var maint_buf: [96]u8 = undefined;
-                const maint_line = std.fmt.bufPrint(
-                    &maint_buf,
-                    "Backup queued {d} retained {d}/{d}",
-                    .{ wp.queuedCompactions(), backup_status.retained, backup_status.retention_limit },
-                ) catch "Backup stats";
+                const metrics = wp.getMaintenanceMetrics();
+                const cadence_seconds = metrics.schedule_interval_seconds;
+                const cadence_minutes = if (cadence_seconds == 0)
+                    0
+                else
+                    @divFloor(cadence_seconds + 59, 60);
+                const cooldown = chunk_manager.backupCooldownSecondsRemaining();
+
+                var maint_buf: [128]u8 = undefined;
+                const maint_line = if (cadence_seconds == 0)
+                    std.fmt.bufPrint(&maint_buf, "Maintenance: paused | queued {d}", .{metrics.queued_regions}) catch "Maintenance cadence"
+                else
+                    std.fmt.bufPrint(&maint_buf, "Maintenance: ~{d}m | queued {d} (~{d}s)", .{ cadence_minutes, metrics.queued_regions, cooldown }) catch "Maintenance cadence";
                 hud_texts[hud_count] = maint_line;
                 hud_count += 1;
                 max_width = @max(max_width, line_text.textWidth(maint_line, hud_scale));
-            }
 
-            if (chunk_manager.world_persistence) |wp| {
+                var activity_buf: [96]u8 = undefined;
+                const activity_line = std.fmt.bufPrint(&activity_buf, "Maintenance activity {d:.1}", .{metrics.recent_activity_score}) catch "Maintenance activity";
+                hud_texts[hud_count] = activity_line;
+                hud_count += 1;
+                max_width = @max(max_width, line_text.textWidth(activity_line, hud_scale));
+
                 const backup_status = wp.backupStatus();
-                if (backup_status.retained > 0 or backup_status.last_backup_timestamp != 0) {
-                    var time_buf: [32]u8 = undefined;
-                    const time_str = if (backup_status.last_backup_timestamp != 0)
-                        formatTimestamp(&time_buf, backup_status.last_backup_timestamp)
-                    else
-                        "none";
+                var time_buf: [32]u8 = undefined;
+                const time_str = if (backup_status.last_backup_timestamp != 0)
+                    formatTimestamp(&time_buf, backup_status.last_backup_timestamp)
+                else
+                    "none";
 
-                    var backup_buf: [96]u8 = undefined;
-                    const backup_line = std.fmt.bufPrint(
-                        &backup_buf,
-                        "Backups: {d}/{d} (last {s})",
-                        .{ backup_status.retained, backup_status.retention_limit, time_str },
-                    ) catch "Backups: status";
+                var backup_buf: [96]u8 = undefined;
+                const backup_line = std.fmt.bufPrint(
+                    &backup_buf,
+                    "Backups: {d}/{d} (last {s})",
+                    .{ backup_status.retained, backup_status.retention_limit, time_str },
+                ) catch "Backups: status";
 
-                    hud_texts[hud_count] = backup_line;
-                    hud_count += 1;
-                    max_width = @max(max_width, line_text.textWidth(backup_line, hud_scale));
-                }
+                hud_texts[hud_count] = backup_line;
+                hud_count += 1;
+                max_width = @max(max_width, line_text.textWidth(backup_line, hud_scale));
             }
 
             if (hud_count > 0) {

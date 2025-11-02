@@ -3,6 +3,9 @@ const terrain = @import("terrain.zig");
 
 pub const default_worlds_root = "worlds";
 pub const default_autosave_interval_seconds: u32 = 30;
+pub const default_backup_schedule_interval_seconds: u32 = 10 * 60;
+pub const minimum_backup_schedule_interval_seconds: u32 = 5 * 60;
+pub const maximum_backup_schedule_interval_seconds: u32 = 20 * 60;
 pub const default_world_difficulty: Difficulty = .normal;
 const region_span = 32;
 const region_entry_count = region_span * region_span;
@@ -59,6 +62,8 @@ pub const WorldSettingsSummary = struct {
     difficulty: Difficulty,
     maintenance_last_timestamp: i64,
     maintenance_queued: usize,
+    maintenance_interval_seconds: u32,
+    maintenance_activity_score: f32,
 };
 
 pub fn loadWorldSettingsSummary(
@@ -78,6 +83,8 @@ pub fn loadWorldSettingsSummary(
         .difficulty = wp.difficulty,
         .maintenance_last_timestamp = maintenance.last_compaction_timestamp,
         .maintenance_queued = maintenance.queued_regions,
+        .maintenance_interval_seconds = maintenance.schedule_interval_seconds,
+        .maintenance_activity_score = maintenance.recent_activity_score,
     };
 }
 
@@ -201,6 +208,8 @@ pub const MaintenanceMetrics = struct {
     last_compaction_timestamp: i64 = 0,
     last_compaction_duration_ns: i128 = 0,
     queued_regions: usize = 0,
+    schedule_interval_seconds: u32 = default_backup_schedule_interval_seconds,
+    recent_activity_score: f32 = 0.0,
 };
 
 /// World metadata stored in world.meta file
@@ -633,6 +642,17 @@ pub const WorldPersistence = struct {
         return self.maintenance_metrics.queued_regions;
     }
 
+    pub fn recordMaintenanceSchedule(
+        self: *WorldPersistence,
+        interval_seconds: u32,
+        activity_score: f32,
+        queued_regions: usize,
+    ) void {
+        self.maintenance_metrics.schedule_interval_seconds = interval_seconds;
+        self.maintenance_metrics.recent_activity_score = activity_score;
+        self.maintenance_metrics.queued_regions = queued_regions;
+    }
+
     pub fn setDifficulty(self: *WorldPersistence, difficulty: Difficulty) void {
         self.difficulty = difficulty;
         self.metadata.difficulty = difficulty;
@@ -699,6 +719,8 @@ pub const WorldPersistence = struct {
     fn loadSettings(self: *WorldPersistence) void {
         self.autosave_interval_seconds = default_autosave_interval_seconds;
         self.region_backup_retention = default_region_backup_retention;
+        self.maintenance_metrics.schedule_interval_seconds = default_backup_schedule_interval_seconds;
+        self.maintenance_metrics.recent_activity_score = 0;
         self.loadAutosaveConfig();
         self.loadBackupConfig();
         self.enforceAllRegionBackups();
@@ -1520,8 +1542,78 @@ test "world settings summary reflects updates" {
     try std.testing.expectEqual(Difficulty.hard, summary.difficulty);
     try std.testing.expectEqual(@as(i64, 0), summary.maintenance_last_timestamp);
     try std.testing.expectEqual(@as(usize, 0), summary.maintenance_queued);
+    try std.testing.expectEqual(default_backup_schedule_interval_seconds, summary.maintenance_interval_seconds);
+    try std.testing.expect(summary.maintenance_activity_score == 0);
 
     wp.queueRegionCompactionRequest(0, 0);
     const metrics = wp.getMaintenanceMetrics();
     try std.testing.expect(metrics.queued_regions > 0);
+}
+
+test "service maintenance processes queued compactions and updates metrics" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tmp_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_path);
+
+    const worlds_root = try std.fs.path.join(allocator, &.{ tmp_path, "worlds" });
+    defer allocator.free(worlds_root);
+    try std.fs.cwd().makePath(worlds_root);
+
+    var wp = try WorldPersistence.init(allocator, "maintenance_service_test", .{
+        .worlds_root = worlds_root,
+        .force_new = true,
+    });
+    defer wp.deinit();
+
+    var chunk = terrain.Chunk.init(0, 0);
+    chunk.generate();
+    try wp.saveChunk(&chunk);
+
+    var region = try wp.openRegionForWrite(0, 0);
+    const coords = chunkRegionCoords(0, 0);
+    const chunk_idx = chunkIndexFromLocal(coords.local_x, coords.local_z);
+    const entry = region.chunk_entries[chunk_idx];
+    try std.testing.expect(entry.size > 0);
+
+    var free_offset = entry.offset + entry.size;
+    const stride: u64 = 64;
+
+    var i: usize = 0;
+    while (i < region_free_capacity) : (i += 1) {
+        region.free_entries[i] = FreeEntry{
+            .offset = free_offset + @as(u64, i) * stride,
+            .length = 1,
+            .reserved = 0,
+        };
+    }
+
+    region.free_count = region_free_capacity;
+    region.header.free_count = @as(u16, @intCast(region_free_capacity));
+    region.file_size = free_offset + @as(u64, region_free_capacity) * stride;
+
+    try region.flush();
+    region.deinit();
+
+    wp.queueRegionCompactionRequest(coords.region_x, coords.region_z);
+    const before = wp.getMaintenanceMetrics();
+    try std.testing.expectEqual(@as(usize, 1), before.queued_regions);
+
+    wp.serviceMaintenance(4);
+
+    const after = wp.getMaintenanceMetrics();
+    try std.testing.expectEqual(@as(usize, 0), after.queued_regions);
+    try std.testing.expect(after.total_compactions >= before.total_compactions + 1);
+    try std.testing.expect(after.last_compaction_duration_ns > 0);
+    try std.testing.expect(after.last_compaction_timestamp >= before.last_compaction_timestamp);
+    try std.testing.expectEqual(before.total_failures, after.total_failures);
+
+    const backup_status = wp.backupStatus();
+    try std.testing.expect(backup_status.retained > 0);
+    try std.testing.expect(backup_status.last_backup_timestamp >= after.last_compaction_timestamp);
 }

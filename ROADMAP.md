@@ -46,14 +46,23 @@ A high-performance voxel-based open world building game optimized for macOS and 
 - [x] Rolling region backup controls (HUD telemetry + F11 maintenance queue)
 - [x] HUD notification stack with expanded LOD and backup telemetry overlays
 - [x] Four-tier LOD detail scheduler with averaged normals and vertical skirts to eliminate seams
+- [x] Dynamic maintenance cadence tuning (activity-weighted 5–20 minute schedule with HUD/menu feedback)
+- [x] Multi-block selection and clipboard tools (selection bounds, copy/paste helpers, regression coverage)
 
 ### 🏗️ In Progress
 - [ ] Performance profiling and optimization (streaming profiler HUD lines in place; next capture data and tune chunk budgets)
 - [ ] Chunk persistence polish (incremental autosave-triggered region backups, save settings UI, automated compaction cadence)
+  - [x] Autosave-triggered region maintenance queue with HUD + console feedback (total/delta counts)
+  - [x] Save settings UI for autosave cadence/backup retention
+  - [x] Scheduled compaction cadence tuning
 - [ ] Test coverage for LOD scheduling and persistence workflows
+  - [x] LOD detail selection hysteresis unit tests
+  - [x] Maintenance queue cooldown regression tests
+  - [x] Maintenance service compaction metrics test
+  - [x] Autosave integration test validating save/load and maintenance queue state
+  - [x] Timer-driven autosave summary regression test
 
 ### 📋 Next Up
-- [ ] Multi-block selection and copy/paste tools
 - [ ] Automated backup scheduling & incremental save snapshots
 - [ ] World management UI polish (per-world settings, difficulty override history)
 - [ ] Environmental simulation design pass (weather, fluids, temperature)
@@ -124,7 +133,7 @@ A high-performance voxel-based open world building game optimized for macOS and 
 - Streaming manager now records per-update timings/queue stats (surfaced on HUD) and autosave runs queue incremental region backups for the currently loaded regions.
 
 **Known Issues:**
-- Autosave-triggered backups need throttling & integrity reporting; add scheduled compaction plus snapshot validation UI.
+- Autosave-triggered backups need throttling & integrity reporting; add snapshot validation UI.
 - HUD notification stack is ephemeral; surface recent autosave/backup events in the world menu history.
 - World management menu needs a dedicated settings pane for autosave cadence, backup retention, and difficulty audit trail.
 - In-game Metal HUD and world selection overlay restored; monitor for regressions when layering additional panels.
